@@ -1,0 +1,234 @@
+/* @8spine-meta
+ * type: MODULE
+ * category: modules
+ * featured: false
+ * trusted: false
+ * nsfw: false
+ */
+
+// ============================================================================
+//  YouTube Music — INSTANT  •  8SPINE Module
+// ----------------------------------------------------------------------------
+//  Goal: real tap-to-play instant playback that ACTUALLY plays in 8SPINE.
+//
+//  Key lessons baked in:
+//   * 8SPINE's native player needs a self-contained PROGRESSIVE mp4 (itag 18)
+//     or HLS — a raw adaptive audio-only segment (itag 140) will NOT play.
+//     So streaming serves progressive itag 18 (fast: ~180ms TTFB, un-throttled).
+//   * The return MUST include a top-level `mimeType` so the player knows how to
+//     decode the stream.
+//   * Single lean ANDROID /player call — no visitorData round-trip (that's the
+//     ~1s stall other modules hit on cold play). IOS audio is a safety fallback.
+//   * Downloads grab the smaller audio-only m4a (itag 140) to save space.
+//   * googlevideo URLs live ~6h, so prefetch is safe -> next track is instant.
+// ============================================================================
+
+const LOG = '[YTM-Instant]';
+const KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
+
+const SEARCH_CLIENT = {
+  name: 'IOS_MUSIC', id: '26', version: '7.27.0',
+  ua: 'com.google.ios.youtubemusic/7.27.0 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
+  host: 'https://music.youtube.com',
+};
+const ANDROID_CLIENT = {
+  name: 'ANDROID', id: '3', version: '20.22.36',
+  ua: 'com.google.android.youtube/20.22.36 (Linux; U; Android 15)',
+  host: 'https://music.youtube.com',
+};
+const IOS_CLIENT = {
+  name: 'IOS', id: '5', version: '20.22.1',
+  ua: 'com.google.ios.youtube/20.22.1 (iPhone16,2; U; CPU iOS 18_5 like Mac OS X)',
+  host: 'https://music.youtube.com',
+};
+// Player order: ANDROID first (gives progressive itag 18 that the player accepts),
+// IOS as a fallback (audio-only) so resolve never dies on one client.
+const PLAYER_CLIENTS = [ANDROID_CLIENT, IOS_CLIENT];
+const SONGS_FILTER = 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D';
+
+const QUALITY = { LOW: 'LOW', HIGH: 'HIGH', LOSSLESS: 'LOSSLESS' };
+const QUALITY_OPTIONS = [
+  { label: 'Low (saves data)', value: QUALITY.LOW },
+  { label: 'High', value: QUALITY.HIGH },
+  { label: 'Best Available', value: QUALITY.LOSSLESS },
+];
+
+// ---------------------------------------------------------------------------
+function buildContext(c) {
+  const client = { clientName: c.name, clientVersion: c.version, userAgent: c.ua, hl: 'en', gl: 'US' };
+  if (c.name === 'ANDROID') {
+    client.androidSdkVersion = 35; client.osName = 'Android'; client.osVersion = '15';
+  } else if (c.name === 'IOS') {
+    client.deviceMake = 'Apple'; client.deviceModel = 'iPhone16,2';
+    client.osName = 'iPhone'; client.osVersion = '18.5.0.22F76';
+  } else {
+    client.deviceMake = 'Apple'; client.deviceModel = 'iPhone16,2';
+    client.osName = 'iPhone'; client.osVersion = '18.3.2.22D82'; client.utcOffsetMinutes = 0;
+  }
+  return { client: client };
+}
+
+async function innertube(client, endpoint, payload) {
+  const res = await fetch(client.host + '/youtubei/v1/' + endpoint + '?prettyPrint=false&key=' + KEY, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': client.ua,
+      'X-YouTube-Client-Name': client.id,
+      'X-YouTube-Client-Version': client.version,
+    },
+    body: JSON.stringify(Object.assign({ context: buildContext(client) }, payload)),
+  });
+  if (!res.ok) throw new Error(LOG + ' ' + endpoint + ' HTTP ' + res.status);
+  return res.json();
+}
+
+function collect(node, key, out) {
+  out = out || [];
+  if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) collect(node[i], key, out); }
+  else if (node && typeof node === 'object') {
+    const ks = Object.keys(node);
+    for (let i = 0; i < ks.length; i++) { if (ks[i] === key) out.push(node[ks[i]]); collect(node[ks[i]], key, out); }
+  }
+  return out;
+}
+function firstVideoId(n) {
+  if (!n || typeof n !== 'object') return null;
+  if (typeof n.videoId === 'string' && n.videoId.length === 11) return n.videoId;
+  const ks = Object.keys(n);
+  for (let i = 0; i < ks.length; i++) { const r = firstVideoId(n[ks[i]]); if (r) return r; }
+  return null;
+}
+function runsToText(r) { if (!Array.isArray(r)) return ''; let s = ''; for (let i = 0; i < r.length; i++) s += (r[i] && r[i].text) || ''; return s; }
+function parseDuration(s) { if (!/^\d+(:\d{1,2})+$/.test(s || '')) return 0; return s.split(':').reduce(function (a, p) { return a * 60 + parseInt(p, 10); }, 0); }
+function upscaleThumb(u) { return typeof u === 'string' ? u.replace(/=w\d+-h\d+/, '=w544-h544') : u; }
+function expireFromUrl(u) { const m = /[?&]expire=(\d+)/.exec(u || ''); return m ? parseInt(m[1], 10) * 1000 : 0; }
+
+// --------------------------------------------------------------- searchTracks
+async function searchTracks(query, limit) {
+  const max = limit || 25;
+  const data = await innertube(SEARCH_CLIENT, 'search', { query: String(query || ''), params: SONGS_FILTER });
+  const rows = collect(data, 'musicTwoColumnItemRenderer');
+  const tracks = [];
+  for (let r = 0; r < rows.length; r++) {
+    const it = rows[r];
+    const videoId = (it.navigationEndpoint && it.navigationEndpoint.watchEndpoint && it.navigationEndpoint.watchEndpoint.videoId) || firstVideoId(it);
+    if (!videoId) continue;
+    const title = runsToText(it.title && it.title.runs).trim();
+    const subRuns = (it.subtitle && it.subtitle.runs) || [];
+    const seg = []; let cur = '';
+    for (let i = 0; i < subRuns.length; i++) {
+      const t = (subRuns[i] && subRuns[i].text) || '';
+      if (t.trim() === '•') { seg.push(cur.trim()); cur = ''; } else cur += t;
+    }
+    if (cur.trim()) seg.push(cur.trim());
+    const artist = (seg[0] || '').trim();
+    let duration = 0;
+    for (let i = 0; i < seg.length; i++) { const d = parseDuration(seg[i].trim()); if (d) { duration = d; break; } }
+    let cover = '';
+    try { const th = it.thumbnail.musicThumbnailRenderer.thumbnail.thumbnails; cover = upscaleThumb(th[th.length - 1].url); } catch (e) {}
+    tracks.push({ id: videoId, title: title, artist: artist, album: '', duration: duration, albumCover: cover });
+    if (tracks.length >= max) break;
+  }
+  return { tracks: tracks, total: tracks.length };
+}
+
+// --------------------------------------------------------------- resolve
+// Returns { url, mimeType, bitrate, contentLength, durationMs } for the chosen
+// format. `forDownload` flips preference to audio-only (smaller).
+async function resolveMedia(trackId, quality, forDownload) {
+  if (!trackId) throw new Error(LOG + ' Missing trackId');
+  let lastErr = null;
+
+  for (let ci = 0; ci < PLAYER_CLIENTS.length; ci++) {
+    try {
+      const data = await innertube(PLAYER_CLIENTS[ci], 'player', {
+        videoId: String(trackId), contentCheckOk: true, racyCheckOk: true,
+      });
+      const ps = (data.playabilityStatus && data.playabilityStatus.status) || 'UNKNOWN';
+      if (ps !== 'OK') { lastErr = new Error(LOG + ' ' + PLAYER_CLIENTS[ci].name + ': ' + ((data.playabilityStatus && data.playabilityStatus.reason) || ps)); continue; }
+
+      const sd = data.streamingData || {};
+      const progressive = (sd.formats || []).filter(function (f) { return f.url && (f.mimeType || '').indexOf('video/mp4') === 0; });
+      const audio = (sd.adaptiveFormats || []).filter(function (f) { return f.url && (f.mimeType || '').indexOf('audio/mp4') === 0; })
+        .sort(function (a, b) { return (a.bitrate || 0) - (b.bitrate || 0); });
+
+      let pick = null;
+      if (forDownload) {
+        // smaller audio-only m4a preferred for downloads
+        if (audio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? audio[0] : audio[audio.length - 1];
+        else if (progressive.length) pick = progressive[0];
+      } else {
+        // STREAMING: progressive itag 18 plays reliably & starts fast
+        if (progressive.length) pick = progressive[0];
+        else if (audio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? audio[0] : audio[audio.length - 1];
+      }
+      if (pick && pick.url) {
+        return {
+          url: pick.url,
+          mimeType: pick.mimeType || (forDownload ? 'audio/mp4' : 'video/mp4'),
+          bitrate: pick.bitrate || 0,
+          contentLength: pick.contentLength ? parseInt(pick.contentLength, 10) : undefined,
+          durationMs: pick.approxDurationMs ? parseInt(pick.approxDurationMs, 10) : undefined,
+          expiresAt: expireFromUrl(pick.url) || undefined,
+        };
+      }
+      lastErr = new Error(LOG + ' ' + PLAYER_CLIENTS[ci].name + ': no usable format');
+    } catch (e) { lastErr = e; }
+  }
+  throw (lastErr || new Error(LOG + ' Could not resolve stream'));
+}
+
+async function getTrackStreamUrl(trackId, preferredQuality, context) {
+  const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
+  const m = await resolveMedia(trackId, quality, false);
+  return {
+    streamUrl: m.url,
+    streamType: 'direct',
+    mimeType: m.mimeType,          // top-level so the player configures decode
+    contentLength: m.contentLength,
+    expiresAt: m.expiresAt,
+    track: { id: String(trackId), audioQuality: quality, bitrate: m.bitrate, mimeType: m.mimeType, durationMs: m.durationMs },
+  };
+}
+
+async function getTrackDownloadUrl(trackId, preferredQuality, context) {
+  const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.LOSSLESS;
+  const m = await resolveMedia(trackId, quality, true);
+  const isAudio = (m.mimeType || '').indexOf('audio') === 0;
+  return {
+    downloadUrl: m.url,
+    streamUrl: m.url,
+    mimeType: m.mimeType,
+    fileName: String(trackId) + (isAudio ? '.m4a' : '.mp4'),
+    track: { id: String(trackId), audioQuality: quality, bitrate: m.bitrate },
+  };
+}
+
+// --------------------------------------------------------------------- export
+return {
+  id: 'ytm-instant',
+  name: 'YouTube Music — Instant',
+  author: 'nvmind',
+  version: '1.2.0',
+  labels: ['YT Music', 'Instant', 'Audio', 'Download'],
+  description: 'Low-latency YouTube Music. Lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, prefetch-enabled, no third-party resolvers.',
+
+  // googlevideo URLs live ~6h -> prefetch + cache within a session is safe.
+  noPrefetch: false,
+  noStreamCache: false,
+
+  settings: {
+    quality: {
+      type: 'selector',
+      label: 'Audio Quality',
+      description: 'Affects downloads & audio-only fallback.',
+      options: QUALITY_OPTIONS,
+      defaultValue: QUALITY.HIGH,
+    },
+  },
+
+  searchTracks: searchTracks,
+  getTrackStreamUrl: getTrackStreamUrl,
+  getTrackDownloadUrl: getTrackDownloadUrl,
+};

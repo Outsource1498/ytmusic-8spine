@@ -1,0 +1,38 @@
+{
+  "category:modules": [
+    {
+      "id": "ytm-instant",
+      "name": "YOUTUBE MUSIC \u2014 INSTANT",
+      "pkg": "com.8spine.module.youtube.instant",
+      "file": "youtubeMusicInstant.8spine",
+      "download": "modules/youtubeMusicInstant.8spine?v=120",
+      "version": "v1.2.0",
+      "code": 120,
+      "type": "MODULE",
+      "author": "nvmind",
+      "description": "LOW-LATENCY YOUTUBE MUSIC. LEAN SINGLE-CALL RESOLVE TO A PLAYER-READY PROGRESSIVE STREAM \u2014 INSTANT PLAYBACK THAT ACTUALLY PLAYS, PREFETCH-ENABLED, NO THIRD-PARTY RESOLVERS.",
+      "tags": [
+        "YT MUSIC",
+        "INSTANT",
+        "DOWNLOAD"
+      ],
+      "featured": false,
+      "trusted": false,
+      "nsfw": false,
+      "size": 10857,
+      "lang": "all",
+      "folder": "modules",
+      "sources": [
+        {
+          "name": "YOUTUBE MUSIC \u2014 INSTANT",
+          "lang": "all",
+          "id": "ytm-instant",
+          "baseUrl": "."
+        }
+      ]
+    }
+  ],
+  "category:debrid_modules": [],
+  "category:artworks": [],
+  "category:testing": []
+}
