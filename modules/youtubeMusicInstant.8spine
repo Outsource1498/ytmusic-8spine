@@ -31,6 +31,11 @@ const SEARCH_CLIENT = {
   ua: 'com.google.ios.youtubemusic/7.27.0 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
   host: 'https://music.youtube.com',
 };
+const WEB_CLIENT = {
+  name: 'WEB_REMIX', id: '67', version: '1.20260304.03.00',
+  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  host: 'https://music.youtube.com',
+};
 const ANDROID_CLIENT = {
   name: 'ANDROID', id: '3', version: '20.22.36',
   ua: 'com.google.android.youtube/20.22.36 (Linux; U; Android 15)',
@@ -45,6 +50,12 @@ const IOS_CLIENT = {
 // IOS as a fallback (audio-only) so resolve never dies on one client.
 const PLAYER_CLIENTS = [ANDROID_CLIENT, IOS_CLIENT];
 const SONGS_FILTER = 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D';
+const MEDIA_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+const MEDIA_CACHE_SAFETY_MS = 30 * 1000;
+const PREFETCH_LIMIT = 3;
+const mediaCache = {};
+const mediaInflight = {};
+let lastTrackList = [];
 
 const QUALITY = { LOW: 'LOW', HIGH: 'HIGH', LOSSLESS: 'LOSSLESS' };
 const QUALITY_OPTIONS = [
@@ -58,13 +69,12 @@ function buildContext(c) {
   const client = { clientName: c.name, clientVersion: c.version, userAgent: c.ua, hl: 'en', gl: 'US' };
   if (c.name === 'ANDROID') {
     client.androidSdkVersion = 35; client.osName = 'Android'; client.osVersion = '15';
-  } else if (c.name === 'IOS') {
+  } else if (c.name === 'IOS' || c.name === 'IOS_MUSIC') {
     client.deviceMake = 'Apple'; client.deviceModel = 'iPhone16,2';
-    client.osName = 'iPhone'; client.osVersion = '18.5.0.22F76';
-  } else {
-    client.deviceMake = 'Apple'; client.deviceModel = 'iPhone16,2';
-    client.osName = 'iPhone'; client.osVersion = '18.3.2.22D82'; client.utcOffsetMinutes = 0;
+    client.osName = 'iPhone'; client.osVersion = c.name === 'IOS' ? '18.5.0.22F76' : '18.3.2.22D82';
   }
+  // WEB_REMIX intentionally carries only the web client context. Adding a
+  // mobile device to it makes album browse responses inconsistent.
   return { client: client };
 }
 
@@ -137,39 +147,194 @@ function normalizeSearchQuery(query) {
   }
 }
 
+function browseIdFromRun(run) {
+  return run?.navigationEndpoint?.browseEndpoint?.browseId || '';
+}
+
+function subtitleMetadata(runs) {
+  const text = runsToText(runs);
+  const parts = text.split(/\s*[•·]\s*/).map(function (part) { return part.trim(); }).filter(Boolean);
+  let duration = 0;
+  const remaining = [];
+  for (let i = 0; i < parts.length; i++) {
+    const parsed = parseDuration(parts[i]);
+    if (parsed && !duration) duration = parsed;
+    else if (!/^Song$|^Video$|^EP$|^Single$|^Podcast$/i.test(parts[i])) remaining.push(parts[i]);
+  }
+  const browseIds = (runs || []).map(function (run) { return browseIdFromRun(run); }).filter(Boolean);
+  return {
+    artist: remaining[0] || '',
+    album: remaining[1] || '',
+    duration: duration,
+    artistId: browseIds[0] || '',
+    albumId: browseIds[1] || '',
+  };
+}
+
+function rendererTitle(renderer) {
+  return runsToText(renderer?.title?.runs) ||
+    runsToText(renderer?.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs) || '';
+}
+
+function rendererSubtitleRuns(renderer) {
+  return renderer?.subtitle?.runs ||
+    renderer?.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+}
+
+function rendererVideoId(renderer) {
+  return renderer?.navigationEndpoint?.watchEndpoint?.videoId ||
+    renderer?.playlistItemData?.videoId || firstVideoId(renderer);
+}
+
+function rendererCover(renderer, fallback) {
+  const thumbs = renderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
+  if (!thumbs.length) return fallback || '';
+  return upscaleThumb(thumbs[thumbs.length - 1].url) || fallback || '';
+}
+
+function mapTrackRenderer(renderer, fallback) {
+  const subtitleRuns = rendererSubtitleRuns(renderer);
+  const meta = subtitleMetadata(subtitleRuns);
+  const fixedDuration = renderer?.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
+  const videoId = rendererVideoId(renderer);
+  if (!videoId) return null;
+  return {
+    id: videoId,
+    title: rendererTitle(renderer).trim(),
+    artist: meta.artist || fallback?.artist || 'Unknown Artist',
+    artistId: meta.artistId || fallback?.artistId,
+    album: meta.album || fallback?.album || '',
+    albumId: meta.albumId || fallback?.albumId,
+    duration: meta.duration || parseDuration(fixedDuration),
+    albumCover: rendererCover(renderer, fallback?.albumCover),
+  };
+}
+
+function mapSearchRows(data, limit) {
+  const rows = collect(data, 'musicTwoColumnItemRenderer')
+    .concat(collect(data, 'musicResponsiveListItemRenderer'));
+  const tracks = [];
+  const seen = {};
+  for (let i = 0; i < rows.length && tracks.length < limit; i++) {
+    const track = mapTrackRenderer(rows[i]);
+    if (!track || seen[track.id]) continue;
+    seen[track.id] = true;
+    tracks.push(track);
+  }
+  return tracks;
+}
+
+function mergeTrackLists(lists, limit) {
+  const tracks = [];
+  const seen = {};
+  for (let li = 0; li < lists.length && tracks.length < limit; li++) {
+    const list = lists[li] || [];
+    for (let i = 0; i < list.length && tracks.length < limit; i++) {
+      const track = list[i];
+      if (!track || !track.id || seen[track.id]) continue;
+      seen[track.id] = true;
+      tracks.push(track);
+    }
+  }
+  return tracks;
+}
+
+function contextTrackIds(context) {
+  const ids = [];
+  const add = function (value) {
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) add(value[i]);
+    } else if (typeof value === 'string' && value && ids.indexOf(value) < 0) {
+      ids.push(value);
+    } else if (value && typeof value === 'object') {
+      add(value.id || value.videoId || value.trackId || value.youtubeId);
+    }
+  };
+  const source = context || {};
+  add(source.nextTrackId);
+  add(source.nextTrackIds);
+  add(source.nextTracks);
+  add(source.queueTracks);
+  add(source.queue);
+  return ids;
+}
+
+function cacheKey(trackId, quality, forDownload) {
+  return (forDownload ? 'download:' : 'playback:') + String(trackId) + ':' + String(quality || QUALITY.HIGH);
+}
+
+function cachedMedia(key) {
+  const entry = mediaCache[key];
+  if (!entry) return null;
+  if (entry.expiresAt > Date.now() + MEDIA_CACHE_SAFETY_MS) return entry.media;
+  delete mediaCache[key];
+  return null;
+}
+
+function resolveCachedMedia(trackId, quality, forDownload) {
+  const key = cacheKey(trackId, quality, forDownload);
+  const cached = cachedMedia(key);
+  if (cached) return Promise.resolve(cached);
+  if (mediaInflight[key]) return mediaInflight[key];
+  mediaInflight[key] = resolveMediaUncached(trackId, quality, forDownload)
+    .then(function (media) {
+      mediaCache[key] = {
+        media: media,
+        expiresAt: media.expiresAt || (Date.now() + MEDIA_CACHE_TTL_MS),
+      };
+      return media;
+    })
+    .finally(function () { delete mediaInflight[key]; });
+  return mediaInflight[key];
+}
+
+function prefetchTracks(tracks, quality) {
+  const items = (tracks || []).slice(0, PREFETCH_LIMIT);
+  for (let i = 0; i < items.length; i++) {
+    if (!items[i]?.id) continue;
+    resolveCachedMedia(items[i].id, quality || QUALITY.HIGH, false).catch(function (error) {
+      console.log(LOG, 'Prefetch failed for', items[i].id, error.message);
+    });
+  }
+}
+
+function prefetchFollowing(trackId, quality, context) {
+  const explicitIds = contextTrackIds(context);
+  if (explicitIds.length) {
+    prefetchTracks(explicitIds.map(function (id) { return { id: id }; }), quality);
+    return;
+  }
+  const index = lastTrackList.findIndex(function (track) { return String(track.id) === String(trackId); });
+  if (index >= 0) prefetchTracks(lastTrackList.slice(index + 1), quality);
+}
+
 // --------------------------------------------------------------- searchTracks
 async function searchTracks(query, limit) {
   const max = limit || 25;
-  const data = await innertube(SEARCH_CLIENT, 'search', { query: normalizeSearchQuery(query), params: SONGS_FILTER });
-  const rows = collect(data, 'musicTwoColumnItemRenderer');
-  const tracks = [];
-  for (let r = 0; r < rows.length; r++) {
-    const it = rows[r];
-    const videoId = (it.navigationEndpoint && it.navigationEndpoint.watchEndpoint && it.navigationEndpoint.watchEndpoint.videoId) || firstVideoId(it);
-    if (!videoId) continue;
-    const title = runsToText(it.title && it.title.runs).trim();
-    const subRuns = (it.subtitle && it.subtitle.runs) || [];
-    const seg = []; let cur = '';
-    for (let i = 0; i < subRuns.length; i++) {
-      const t = (subRuns[i] && subRuns[i].text) || '';
-      if (t.trim() === '•') { seg.push(cur.trim()); cur = ''; } else cur += t;
-    }
-    if (cur.trim()) seg.push(cur.trim());
-    const artist = (seg[0] || '').trim();
-    let duration = 0;
-    for (let i = 0; i < seg.length; i++) { const d = parseDuration(seg[i].trim()); if (d) { duration = d; break; } }
-    let cover = '';
-    try { const th = it.thumbnail.musicThumbnailRenderer.thumbnail.thumbnails; cover = upscaleThumb(th[th.length - 1].url); } catch (e) {}
-    tracks.push({ id: videoId, title: title, artist: artist, album: '', duration: duration, albumCover: cover });
-    if (tracks.length >= max) break;
+  const normalized = normalizeSearchQuery(query);
+  // Keep the song-filtered result first, then merge a general web result. The
+  // latter is important for emoji-titled art tracks and album-linked results
+  // that YouTube does not expose in the filtered shelf.
+  const responses = await Promise.all([
+    innertube(SEARCH_CLIENT, 'search', { query: normalized, params: SONGS_FILTER }).catch(function () { return null; }),
+    innertube(WEB_CLIENT, 'search', { query: normalized, params: SONGS_FILTER }).catch(function () { return null; }),
+    innertube(WEB_CLIENT, 'search', { query: normalized }).catch(function () { return null; }),
+  ]);
+  const lists = [];
+  for (let i = 0; i < responses.length; i++) {
+    if (responses[i]) lists.push(mapSearchRows(responses[i], max));
   }
+  const tracks = mergeTrackLists(lists, max);
+  // Keep the result list for queue-aware prefetch. Do not resolve speculative
+  // media while search is returning; that adds contention to first playback.
+  lastTrackList = tracks;
   return { tracks: tracks, total: tracks.length };
 }
 
 // --------------------------------------------------------------- resolve
 // Returns { url, mimeType, bitrate, contentLength, durationMs } for the chosen
 // format. `forDownload` flips preference to audio-only (smaller).
-async function resolveMedia(trackId, quality, forDownload) {
+async function resolveMediaUncached(trackId, quality, forDownload) {
   if (!trackId) throw new Error(LOG + ' Missing trackId');
   let lastErr = null;
 
@@ -209,6 +374,7 @@ async function resolveMedia(trackId, quality, forDownload) {
           return {
             url: sd.hlsManifestUrl,
             mimeType: 'application/vnd.apple.mpegurl',
+            isHls: true,
             bitrate: 0,
             contentLength: undefined,
             durationMs: undefined,
@@ -224,10 +390,11 @@ async function resolveMedia(trackId, quality, forDownload) {
         return {
           url: pickedUrl,
           mimeType: pick.mimeType || (forDownload ? 'audio/mp4' : 'video/mp4'),
+          isHls: false,
           bitrate: pick.bitrate || 0,
           contentLength: pick.contentLength ? parseInt(pick.contentLength, 10) : undefined,
           durationMs: pick.approxDurationMs ? parseInt(pick.approxDurationMs, 10) : undefined,
-          expiresAt: expireFromUrl(pick.url) || undefined,
+          expiresAt: expireFromUrl(pickedUrl) || undefined,
         };
       }
       lastErr = new Error(LOG + ' ' + PLAYER_CLIENTS[ci].name + ': no usable format');
@@ -238,10 +405,11 @@ async function resolveMedia(trackId, quality, forDownload) {
 
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
   const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
-  const m = await resolveMedia(trackId, quality, false);
+  const m = await resolveCachedMedia(trackId, quality, false);
+  prefetchFollowing(trackId, quality, context);
   return {
     streamUrl: m.url,
-    streamType: 'direct',
+    streamType: m.isHls ? 'hls' : 'direct',
     mimeType: m.mimeType,          // top-level so the player configures decode
     contentLength: m.contentLength,
     expiresAt: m.expiresAt,
@@ -251,7 +419,7 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 
 async function getTrackDownloadUrl(trackId, preferredQuality, context) {
   const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.LOSSLESS;
-  const m = await resolveMedia(trackId, quality, true);
+  const m = await resolveCachedMedia(trackId, quality, true);
   const isAudio = (m.mimeType || '').indexOf('audio/') === 0;
   const isMp4Audio = (m.mimeType || '').indexOf('audio/mp4') === 0;
   return {
@@ -263,12 +431,91 @@ async function getTrackDownloadUrl(trackId, preferredQuality, context) {
   };
 }
 
+function albumHeader(data, albumId) {
+  const header = data?.header?.musicDetailHeaderRenderer ||
+    data?.header?.musicImmersiveHeaderRenderer ||
+    collect(data, 'musicDetailHeaderRenderer')[0] ||
+    collect(data, 'musicImmersiveHeaderRenderer')[0] || {};
+  const microTitle = data?.microformat?.microformatDataRenderer?.title || '';
+  const headerTitle = runsToText(header?.title?.runs).trim();
+  const rawTitle = headerTitle || microTitle;
+  const byMatch = /^(.*?)\s+-\s+(?:Full Moon Edition|Album|Single|EP)\s+by\s+(.+)$/i.exec(rawTitle);
+  const title = (byMatch ? byMatch[1] : rawTitle).trim() || String(albumId);
+  const headerMeta = subtitleMetadata(header?.subtitle?.runs || []);
+  return {
+    title: title,
+    artist: byMatch ? byMatch[2].trim() : (headerMeta.artist || 'Unknown Artist'),
+    artistId: headerMeta.artistId,
+    albumCover: rendererCover(header, '') || rendererCover(data?.background, ''),
+  };
+}
+
+function albumRows(data) {
+  const shelves = collect(data, 'musicShelfRenderer');
+  for (let i = 0; i < shelves.length; i++) {
+    const rows = (shelves[i].contents || [])
+      .map(function (item) { return item?.musicResponsiveListItemRenderer || item?.musicTwoColumnItemRenderer; })
+      .filter(Boolean);
+    if (rows.some(function (row) { return rendererVideoId(row); })) return rows;
+  }
+  return collect(data, 'musicResponsiveListItemRenderer')
+    .concat(collect(data, 'musicTwoColumnItemRenderer'));
+}
+
+async function getAlbum(albumId) {
+  if (!albumId) throw new Error(LOG + ' Missing albumId');
+  const clients = [WEB_CLIENT, SEARCH_CLIENT];
+  let chosen = null;
+  let rows = [];
+  let lastErr = null;
+  for (let i = 0; i < clients.length; i++) {
+    try {
+      const data = await innertube(clients[i], 'browse', { browseId: String(albumId) });
+      const candidateRows = albumRows(data);
+      if (candidateRows.length) { chosen = data; rows = candidateRows; break; }
+      lastErr = new Error(LOG + ' ' + clients[i].name + ': album has no track rows');
+    } catch (e) { lastErr = e; }
+  }
+  if (!chosen) throw (lastErr || new Error(LOG + ' Could not load album'));
+
+  const info = albumHeader(chosen, albumId);
+  const fallback = {
+    artist: info.artist,
+    artistId: info.artistId,
+    album: info.title,
+    albumId: String(albumId),
+    albumCover: info.albumCover,
+  };
+  const tracks = [];
+  const seen = {};
+  for (let i = 0; i < rows.length; i++) {
+    const track = mapTrackRenderer(rows[i], fallback);
+    if (!track || seen[track.id]) continue;
+    seen[track.id] = true;
+    tracks.push(track);
+  }
+  if (!tracks.length) throw new Error(LOG + ' Album rows contained no playable track IDs');
+  // The current track request will prefetch only the following tracks from
+  // this list, avoiding unnecessary player calls for the beginning of an album.
+  lastTrackList = tracks;
+  return {
+    album: {
+      id: String(albumId),
+      title: info.title,
+      artist: info.artist,
+      artistId: info.artistId,
+      albumCover: info.albumCover || tracks[0].albumCover || '',
+    },
+    tracks: tracks,
+  };
+}
+
 // --------------------------------------------------------------------- export
 return {
   id: 'ytm-instant',
   name: 'YouTube Music — Instant',
   author: 'nvmind',
-  version: '1.2.0',
+  version: '1.4.0',
   labels: ['YT Music', 'Instant', 'Audio', 'Download'],
   description: 'Low-latency YouTube Music. Lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, prefetch-enabled, no third-party resolvers.',
 
@@ -289,4 +536,5 @@ return {
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl,
   getTrackDownloadUrl: getTrackDownloadUrl,
+  getAlbum: getAlbum,
 };
