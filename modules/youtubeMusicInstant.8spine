@@ -104,10 +104,43 @@ function parseDuration(s) { if (!/^\d+(:\d{1,2})+$/.test(s || '')) return 0; ret
 function upscaleThumb(u) { return typeof u === 'string' ? u.replace(/=w\d+-h\d+/, '=w544-h544') : u; }
 function expireFromUrl(u) { const m = /[?&]expire=(\d+)/.exec(u || ''); return m ? parseInt(m[1], 10) * 1000 : 0; }
 
+function decodeParam(value) {
+  try { return decodeURIComponent(String(value || '')); }
+  catch (e) { return String(value || ''); }
+}
+
+function cipherParam(cipher, name) {
+  const match = new RegExp('(?:^|&)' + name + '=([^&]*)').exec(String(cipher || ''));
+  return match ? decodeParam(match[1]) : '';
+}
+
+function directFormatUrl(format) {
+  if (format && format.url) return format.url;
+  const cipher = format && (format.signatureCipher || format.cipher);
+  if (!cipher) return '';
+
+  const url = cipherParam(cipher, 'url');
+  const signature = cipherParam(cipher, 'sig') || cipherParam(cipher, 'signature');
+  if (!url || !signature) return '';
+
+  const separator = url.indexOf('?') >= 0 ? '&' : '?';
+  const parameter = cipherParam(cipher, 'sp') || 'signature';
+  return url + separator + parameter + '=' + encodeURIComponent(signature);
+}
+
+function normalizeSearchQuery(query) {
+  const raw = String(query || '');
+  try {
+    return decodeURIComponent(raw);
+  } catch (e) {
+    return raw;
+  }
+}
+
 // --------------------------------------------------------------- searchTracks
 async function searchTracks(query, limit) {
   const max = limit || 25;
-  const data = await innertube(SEARCH_CLIENT, 'search', { query: String(query || ''), params: SONGS_FILTER });
+  const data = await innertube(SEARCH_CLIENT, 'search', { query: normalizeSearchQuery(query), params: SONGS_FILTER });
   const rows = collect(data, 'musicTwoColumnItemRenderer');
   const tracks = [];
   for (let r = 0; r < rows.length; r++) {
@@ -149,23 +182,47 @@ async function resolveMedia(trackId, quality, forDownload) {
       if (ps !== 'OK') { lastErr = new Error(LOG + ' ' + PLAYER_CLIENTS[ci].name + ': ' + ((data.playabilityStatus && data.playabilityStatus.reason) || ps)); continue; }
 
       const sd = data.streamingData || {};
-      const progressive = (sd.formats || []).filter(function (f) { return f.url && (f.mimeType || '').indexOf('video/mp4') === 0; });
-      const audio = (sd.adaptiveFormats || []).filter(function (f) { return f.url && (f.mimeType || '').indexOf('audio/mp4') === 0; })
+      const progressive = (sd.formats || [])
+        .filter(function (f) {
+          const mime = f.mimeType || '';
+          return directFormatUrl(f) && mime.indexOf('video/mp4') === 0 && mime.indexOf('mp4a') >= 0;
+        });
+      const progressiveFallback = (sd.formats || [])
+        .filter(function (f) { return directFormatUrl(f) && (f.mimeType || '').indexOf('video/mp4') === 0; });
+      const audio = (sd.adaptiveFormats || [])
+        .filter(function (f) { return directFormatUrl(f) && (f.mimeType || '').indexOf('audio/') === 0; })
         .sort(function (a, b) { return (a.bitrate || 0) - (b.bitrate || 0); });
+      const audioMp4 = audio.filter(function (f) { return (f.mimeType || '').indexOf('audio/mp4') === 0; });
 
       let pick = null;
       if (forDownload) {
         // smaller audio-only m4a preferred for downloads
-        if (audio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? audio[0] : audio[audio.length - 1];
+        const preferredAudio = audioMp4.length ? audioMp4 : audio;
+        if (preferredAudio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? preferredAudio[0] : preferredAudio[preferredAudio.length - 1];
         else if (progressive.length) pick = progressive[0];
+        else if (progressiveFallback.length) pick = progressiveFallback[0];
       } else {
         // STREAMING: progressive itag 18 plays reliably & starts fast
         if (progressive.length) pick = progressive[0];
-        else if (audio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? audio[0] : audio[audio.length - 1];
+        else if (progressiveFallback.length) pick = progressiveFallback[0];
+        else if (sd.hlsManifestUrl) {
+          return {
+            url: sd.hlsManifestUrl,
+            mimeType: 'application/vnd.apple.mpegurl',
+            bitrate: 0,
+            contentLength: undefined,
+            durationMs: undefined,
+            expiresAt: expireFromUrl(sd.hlsManifestUrl) || undefined,
+          };
+        } else if (audio.length) {
+          const preferredAudio = audioMp4.length ? audioMp4 : audio;
+          pick = String(quality).toUpperCase() === QUALITY.LOW ? preferredAudio[0] : preferredAudio[preferredAudio.length - 1];
+        }
       }
-      if (pick && pick.url) {
+      const pickedUrl = directFormatUrl(pick);
+      if (pick && pickedUrl) {
         return {
-          url: pick.url,
+          url: pickedUrl,
           mimeType: pick.mimeType || (forDownload ? 'audio/mp4' : 'video/mp4'),
           bitrate: pick.bitrate || 0,
           contentLength: pick.contentLength ? parseInt(pick.contentLength, 10) : undefined,
@@ -195,12 +252,13 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 async function getTrackDownloadUrl(trackId, preferredQuality, context) {
   const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.LOSSLESS;
   const m = await resolveMedia(trackId, quality, true);
-  const isAudio = (m.mimeType || '').indexOf('audio') === 0;
+  const isAudio = (m.mimeType || '').indexOf('audio/') === 0;
+  const isMp4Audio = (m.mimeType || '').indexOf('audio/mp4') === 0;
   return {
     downloadUrl: m.url,
     streamUrl: m.url,
     mimeType: m.mimeType,
-    fileName: String(trackId) + (isAudio ? '.m4a' : '.mp4'),
+    fileName: String(trackId) + (isMp4Audio ? '.m4a' : isAudio ? '.webm' : '.mp4'),
     track: { id: String(trackId), audioQuality: quality, bitrate: m.bitrate },
   };
 }
