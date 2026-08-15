@@ -418,7 +418,7 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 }
 
 async function getTrackDownloadUrl(trackId, preferredQuality, context) {
-  const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.LOSSLESS;
+  const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
   const m = await resolveCachedMedia(trackId, quality, true);
   const isAudio = (m.mimeType || '').indexOf('audio/') === 0;
   const isMp4Audio = (m.mimeType || '').indexOf('audio/mp4') === 0;
@@ -515,13 +515,16 @@ return {
   id: 'ytm-instant',
   name: 'YouTube Music — Instant',
   author: 'nvmind',
-  version: '1.4.0',
+  version: '1.4.1',
   labels: ['YT Music', 'Instant', 'Audio', 'Download'],
   description: 'Low-latency YouTube Music. Lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, prefetch-enabled, no third-party resolvers.',
 
-  // googlevideo URLs live ~6h -> prefetch + cache within a session is safe.
+  // googlevideo URLs live ~6h and 403 once expired, so 8SPINE must NOT
+  // persist them between sessions: this module resolves+caches fresh URLs
+  // itself. noStreamCache: true keeps 8SPINE from reusing expired URLs for
+  // later downloads (that was the "download does nothing" failure).
   noPrefetch: false,
-  noStreamCache: false,
+  noStreamCache: true,
 
   settings: {
     quality: {
