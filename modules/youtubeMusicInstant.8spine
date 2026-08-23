@@ -18,9 +18,15 @@
 //   * The return MUST include a top-level `mimeType` so the player knows how to
 //     decode the stream.
 //   * Single lean ANDROID /player call — no visitorData round-trip (that's the
-//     ~1s stall other modules hit on cold play). IOS audio is a safety fallback.
-//   * Downloads grab the smaller audio-only m4a (itag 140) to save space.
+//     ~1s stall other modules hit on cold play). ANDROID_VR then IOS audio are
+//     safety fallbacks so one bot-walled client never kills playback.
+//   * Downloads serve the same progressive itag 18 as playback: full-speed
+//     (ratebypass), a standard mp42 the player accepts, and instantly cached
+//     if the track was already streamed or prefetched.
 //   * googlevideo URLs live ~6h, so prefetch is safe -> next track is instant.
+//   * Search fuses several query variants (raw + letters-only, unfiltered +
+//     videos filter) and ranks by relevance: song rows first, episodes and
+//     karaoke/covers pushed down. Names and emoji titles both match.
 // ============================================================================
 
 const LOG = '[YTM-Instant]';
@@ -36,9 +42,21 @@ const WEB_CLIENT = {
   ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   host: 'https://music.youtube.com',
 };
+// Plain YouTube web search: YT Music's backend omits many official music
+// videos for anonymous callers, YouTube's ranks them first.
+const YOUTUBE_WEB_CLIENT = {
+  name: 'WEB', id: '1', version: '2.20250814.01.00',
+  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+  host: 'https://www.youtube.com',
+};
 const ANDROID_CLIENT = {
   name: 'ANDROID', id: '3', version: '20.22.36',
   ua: 'com.google.android.youtube/20.22.36 (Linux; U; Android 15)',
+  host: 'https://music.youtube.com',
+};
+const ANDROID_VR_CLIENT = {
+  name: 'ANDROID_VR', id: '28', version: '1.62.27',
+  ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L)',
   host: 'https://music.youtube.com',
 };
 const IOS_CLIENT = {
@@ -47,9 +65,12 @@ const IOS_CLIENT = {
   host: 'https://music.youtube.com',
 };
 // Player order: ANDROID first (gives progressive itag 18 that the player accepts),
-// IOS as a fallback (audio-only) so resolve never dies on one client.
-const PLAYER_CLIENTS = [ANDROID_CLIENT, IOS_CLIENT];
-const SONGS_FILTER = 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D';
+// ANDROID_VR as a second progressive-capable client, IOS last (audio-only) so
+// resolve never dies on one client.
+const PLAYER_CLIENTS = [ANDROID_CLIENT, ANDROID_VR_CLIENT, IOS_CLIENT];
+// The old songs filter param stopped returning rows. The videos filter still
+// works and surfaces official song videos first, so it feeds the ranker.
+const VIDEOS_FILTER = 'EgWKAQIQAWoKEAkQChAEEAMQBA%3D%3D';
 const MEDIA_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 const MEDIA_CACHE_SAFETY_MS = 30 * 1000;
 const PREFETCH_LIMIT = 3;
@@ -67,8 +88,9 @@ const QUALITY_OPTIONS = [
 // ---------------------------------------------------------------------------
 function buildContext(c) {
   const client = { clientName: c.name, clientVersion: c.version, userAgent: c.ua, hl: 'en', gl: 'US' };
-  if (c.name === 'ANDROID') {
-    client.androidSdkVersion = 35; client.osName = 'Android'; client.osVersion = '15';
+  if (c.name.indexOf('ANDROID') === 0) {
+    client.androidSdkVersion = c.name === 'ANDROID_VR' ? 32 : 35;
+    client.osName = 'Android'; client.osVersion = c.name === 'ANDROID_VR' ? '12L' : '15';
   } else if (c.name === 'IOS' || c.name === 'IOS_MUSIC') {
     client.deviceMake = 'Apple'; client.deviceModel = 'iPhone16,2';
     client.osName = 'iPhone'; client.osVersion = c.name === 'IOS' ? '18.5.0.22F76' : '18.3.2.22D82';
@@ -155,17 +177,21 @@ function subtitleMetadata(runs) {
   const text = runsToText(runs);
   const parts = text.split(/\s*[•·]\s*/).map(function (part) { return part.trim(); }).filter(Boolean);
   let duration = 0;
+  let type = '';
   const remaining = [];
   for (let i = 0; i < parts.length; i++) {
     const parsed = parseDuration(parts[i]);
-    if (parsed && !duration) duration = parsed;
-    else if (!/^Song$|^Video$|^EP$|^Single$|^Podcast$/i.test(parts[i])) remaining.push(parts[i]);
+    if (parsed && !duration) { duration = parsed; continue; }
+    const typeMatch = /^(Song|Video|Episode|Podcast|EP|Single)$/i.exec(parts[i]);
+    if (typeMatch) { if (!type) type = typeMatch[1].toLowerCase(); continue; }
+    remaining.push(parts[i]);
   }
   const browseIds = (runs || []).map(function (run) { return browseIdFromRun(run); }).filter(Boolean);
   return {
     artist: remaining[0] || '',
     album: remaining[1] || '',
     duration: duration,
+    type: type,
     artistId: browseIds[0] || '',
     albumId: browseIds[1] || '',
   };
@@ -207,12 +233,33 @@ function mapTrackRenderer(renderer, fallback) {
     albumId: meta.albumId || fallback?.albumId,
     duration: meta.duration || parseDuration(fixedDuration),
     albumCover: rendererCover(renderer, fallback?.albumCover),
+    mediaType: meta.type || '',
+  };
+}
+
+// Plain-YouTube search rows (videoRenderer) — artist is the channel name and
+// there is no album linkage, but these carry the official music videos.
+function mapVideoRenderer(renderer) {
+  const videoId = renderer?.videoId;
+  if (!videoId) return null;
+  const thumbs = renderer?.thumbnail?.thumbnails || [];
+  return {
+    id: videoId,
+    title: runsToText(renderer?.title?.runs).trim(),
+    artist: runsToText(renderer?.ownerText?.runs).trim() || 'Unknown Artist',
+    artistId: renderer?.ownerText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId || undefined,
+    album: '',
+    albumId: undefined,
+    duration: parseDuration(renderer?.lengthText?.simpleText || ''),
+    albumCover: thumbs.length ? upscaleThumb(thumbs[thumbs.length - 1].url) : '',
+    mediaType: 'video',
   };
 }
 
 function mapSearchRows(data, limit) {
   const rows = collect(data, 'musicTwoColumnItemRenderer')
     .concat(collect(data, 'musicResponsiveListItemRenderer'));
+  const videos = collect(data, 'videoRenderer');
   const tracks = [];
   const seen = {};
   for (let i = 0; i < rows.length && tracks.length < limit; i++) {
@@ -221,22 +268,83 @@ function mapSearchRows(data, limit) {
     seen[track.id] = true;
     tracks.push(track);
   }
+  for (let i = 0; i < videos.length && tracks.length < limit; i++) {
+    const track = mapVideoRenderer(videos[i]);
+    if (!track || !track.title || seen[track.id]) continue;
+    seen[track.id] = true;
+    tracks.push(track);
+  }
   return tracks;
 }
 
-function mergeTrackLists(lists, limit) {
-  const tracks = [];
-  const seen = {};
-  for (let li = 0; li < lists.length && tracks.length < limit; li++) {
+// ------------------------------------------------------------- text ranking
+// Comparison-only normalization: strips emoji, diacritics and punctuation so
+// titles like "In the Name of 💖LOVE💖" match a typed "love" query. Original
+// titles are never mutated — this only feeds scoring.
+function normalizeForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+function matchTokens(value) {
+  const normalized = normalizeForMatch(value);
+  return normalized ? normalized.split(' ') : [];
+}
+
+const NON_ORIGINAL_RE = /\b(karaoke|cover|tribute|instrumental|nightcore|sped up|slowed)\b/;
+
+// Higher is better. rankSum is the fused position across the query variants
+// (YouTube's own relevance order), the rest are content signals.
+function scoreTrack(track, queryTokens, queryNorm, rankSum) {
+  let score = rankSum * 2;
+  if (track.mediaType === 'song') score += 4;
+  else if (track.mediaType === 'episode' || track.mediaType === 'podcast') score -= 5;
+
+  if (queryNorm) {
+    const haystack = normalizeForMatch(track.title + ' ' + track.artist);
+    let hits = 0;
+    for (let i = 0; i < queryTokens.length; i++) {
+      if (haystack.indexOf(queryTokens[i]) >= 0) hits++;
+    }
+    score += (hits / queryTokens.length) * 4;
+    if (normalizeForMatch(track.title).indexOf(queryNorm) === 0) score += 1.5;
+    if (/\bofficial\b/.test(normalizeForMatch(track.title))) score += 1;
+    if (NON_ORIGINAL_RE.test(haystack) && !NON_ORIGINAL_RE.test(queryNorm)) score -= 2;
+  }
+  if (!track.duration) score -= 0.5;
+  // 10+ minute results for a short query are almost always loops, mixes or
+  // compilations — terrible playback candidates for a song search.
+  if (track.duration > 600 && !/\b(mix|compilation|loop|full album|playlist)\b/.test(queryNorm)) score -= 2;
+  return score;
+}
+
+function rankTrackLists(lists, query, limit) {
+  const queryTokens = matchTokens(query);
+  const queryNorm = queryTokens.join(' ');
+  const byId = {};
+  for (let li = 0; li < lists.length; li++) {
     const list = lists[li] || [];
-    for (let i = 0; i < list.length && tracks.length < limit; i++) {
+    for (let i = 0; i < list.length; i++) {
       const track = list[i];
-      if (!track || !track.id || seen[track.id]) continue;
-      seen[track.id] = true;
-      tracks.push(track);
+      if (!track || !track.id) continue;
+      const entry = byId[track.id] || (byId[track.id] = { track: track, rankSum: 0 });
+      entry.rankSum += 1 / (i + 1);
     }
   }
-  return tracks;
+  const ranked = Object.keys(byId).map(function (id) {
+    const entry = byId[id];
+    return { track: entry.track, score: scoreTrack(entry.track, queryTokens, queryNorm, entry.rankSum) };
+  });
+  ranked.sort(function (a, b) { return b.score - a.score; });
+  return ranked.slice(0, limit).map(function (entry) {
+    const track = entry.track;
+    delete track.mediaType;
+    return track;
+  });
 }
 
 function contextTrackIds(context) {
@@ -311,20 +419,29 @@ function prefetchFollowing(trackId, quality, context) {
 // --------------------------------------------------------------- searchTracks
 async function searchTracks(query, limit) {
   const max = limit || 25;
-  const normalized = normalizeSearchQuery(query);
-  // Keep the song-filtered result first, then merge a general web result. The
-  // latter is important for emoji-titled art tracks and album-linked results
-  // that YouTube does not expose in the filtered shelf.
-  const responses = await Promise.all([
-    innertube(SEARCH_CLIENT, 'search', { query: normalized, params: SONGS_FILTER }).catch(function () { return null; }),
-    innertube(WEB_CLIENT, 'search', { query: normalized, params: SONGS_FILTER }).catch(function () { return null; }),
-    innertube(WEB_CLIENT, 'search', { query: normalized }).catch(function () { return null; }),
-  ]);
+  const raw = normalizeSearchQuery(query).replace(/\s+/g, ' ').trim();
+  // Emoji-titled tracks ("In the Name of 💖LOVE💖") surface better when the
+  // emoji is kept, but some queries resolve poorly with symbols in them — so
+  // query both the raw string and its letters-only form and let the ranker
+  // fuse the lists.
+  const queries = [raw];
+  const lettersOnly = matchTokens(raw).join(' ');
+  if (lettersOnly && lettersOnly !== raw.toLowerCase()) queries.push(lettersOnly);
+
+  const requests = [];
+  for (let qi = 0; qi < queries.length; qi++) {
+    requests.push(innertube(WEB_CLIENT, 'search', { query: queries[qi] }).catch(function () { return null; }));
+    requests.push(innertube(WEB_CLIENT, 'search', { query: queries[qi], params: VIDEOS_FILTER }).catch(function () { return null; }));
+    requests.push(innertube(YOUTUBE_WEB_CLIENT, 'search', { query: queries[qi] }).catch(function () { return null; }));
+  }
+  requests.push(innertube(SEARCH_CLIENT, 'search', { query: raw }).catch(function () { return null; }));
+
+  const responses = await Promise.all(requests);
   const lists = [];
   for (let i = 0; i < responses.length; i++) {
     if (responses[i]) lists.push(mapSearchRows(responses[i], max));
   }
-  const tracks = mergeTrackLists(lists, max);
+  const tracks = rankTrackLists(lists, raw, max);
   // Keep the result list for queue-aware prefetch. Do not resolve speculative
   // media while search is returning; that adds contention to first playback.
   lastTrackList = tracks;
@@ -333,7 +450,7 @@ async function searchTracks(query, limit) {
 
 // --------------------------------------------------------------- resolve
 // Returns { url, mimeType, bitrate, contentLength, durationMs } for the chosen
-// format. `forDownload` flips preference to audio-only (smaller).
+// format. `forDownload` skips the HLS fallback — a download must be a file.
 async function resolveMediaUncached(trackId, quality, forDownload) {
   if (!trackId) throw new Error(LOG + ' Missing trackId');
   let lastErr = null;
@@ -361,11 +478,17 @@ async function resolveMediaUncached(trackId, quality, forDownload) {
 
       let pick = null;
       if (forDownload) {
-        // smaller audio-only m4a preferred for downloads
-        const preferredAudio = audioMp4.length ? audioMp4 : audio;
-        if (preferredAudio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? preferredAudio[0] : preferredAudio[preferredAudio.length - 1];
-        else if (progressive.length) pick = progressive[0];
+        // Downloads must be a complete, standard file: progressive itag 18 is
+        // ratebypass'd (full-speed) and a normal mp42 the player accepts. The
+        // audio-only m4a is a DASH-init container throttled to ~30KB/s, which
+        // is exactly what 8SPINE flags as "corrupted" — audio-only is a last
+        // resort only.
+        if (progressive.length) pick = progressive[0];
         else if (progressiveFallback.length) pick = progressiveFallback[0];
+        else {
+          const preferredAudio = audioMp4.length ? audioMp4 : audio;
+          if (preferredAudio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? preferredAudio[0] : preferredAudio[preferredAudio.length - 1];
+        }
       } else {
         // STREAMING: progressive itag 18 plays reliably & starts fast
         if (progressive.length) pick = progressive[0];
@@ -419,7 +542,11 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 
 async function getTrackDownloadUrl(trackId, preferredQuality, context) {
   const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
-  const m = await resolveCachedMedia(trackId, quality, true);
+  // Downloads and playback now use the same progressive format, so resolve
+  // through the shared playback cache: a track that was streamed or prefetched
+  // downloads instantly without a second player call.
+  let m = await resolveCachedMedia(trackId, quality, false);
+  if (m.isHls) m = await resolveCachedMedia(trackId, quality, true); // need a real file, not a playlist
   const isAudio = (m.mimeType || '').indexOf('audio/') === 0;
   const isMp4Audio = (m.mimeType || '').indexOf('audio/mp4') === 0;
   return {
@@ -515,9 +642,18 @@ return {
   id: 'ytm-instant',
   name: 'YouTube Music — Instant',
   author: 'nvmind',
-  version: '1.4.1',
+  version: '1.5.1',
   labels: ['YT Music', 'Instant', 'Audio', 'Download'],
-  description: 'Low-latency YouTube Music. Lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, prefetch-enabled, no third-party resolvers.',
+  description: 'Low-latency YouTube Music. Ranked search that handles names & emoji titles, lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, reliable full-speed downloads, prefetch-enabled, no third-party resolvers.',
+
+  // Provider identity, matching how 8SPINE presents providers like
+  // Apple Music / YouTube Music in the source picker.
+  provider: {
+    id: 'youtube-music',
+    name: 'YouTube Music',
+    emoji: '🎵',
+    color: '#FF0000',
+  },
 
   // googlevideo URLs live ~6h and 403 once expired, so 8SPINE must NOT
   // persist them between sessions: this module resolves+caches fresh URLs
@@ -530,7 +666,7 @@ return {
     quality: {
       type: 'selector',
       label: 'Audio Quality',
-      description: 'Affects downloads & audio-only fallback.',
+      description: 'Used when only audio-only formats are available.',
       options: QUALITY_OPTIONS,
       defaultValue: QUALITY.HIGH,
     },
