@@ -499,6 +499,7 @@ async function resolveMediaUncached(trackId, quality, forDownload) {
       const audioMp4 = audio.filter(function (f) { return (f.mimeType || '').indexOf('audio/mp4') === 0; });
 
       let pick = null;
+      let useHls = false;
       if (forDownload) {
         // Downloads must be a complete, standard file: progressive itag 18 is
         // ratebypass'd (full-speed) and a normal mp42 the player accepts. The
@@ -512,29 +513,42 @@ async function resolveMediaUncached(trackId, quality, forDownload) {
           if (preferredAudio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? preferredAudio[0] : preferredAudio[preferredAudio.length - 1];
         }
       } else {
-        // STREAMING: progressive itag 18 plays reliably & starts fast
-        if (progressive.length) pick = progressive[0];
-        else if (progressiveFallback.length) pick = progressiveFallback[0];
-        else if (sd.hlsManifestUrl) {
-          return {
-            url: sd.hlsManifestUrl,
-            mimeType: 'application/vnd.apple.mpegurl',
-            isHls: true,
-            bitrate: 0,
-            contentLength: undefined,
-            durationMs: undefined,
-            expiresAt: expireFromUrl(sd.hlsManifestUrl) || undefined,
-          };
+        // STREAMING: 8SPINE's spec requires a "direct, playable AUDIO URL
+        // (MP3, FLAC, M4A)". Returning video/mp4 (itag 18) worked on iOS
+        // (AVPlayer extracts audio from video containers) but Android's audio
+        // player rejects video/* mime types — length shows but no playback.
+        // So prefer audio-only m4a (itag 140): correct audio/mp4 mime, moov at
+        // front for instant init, range-able. It's server-throttled (~2x
+        // realtime for 128kbps AAC) but the 4-ahead prefetch covers that.
+        // Fall back to progressive video only if no audio format exists.
+        if (audioMp4.length) {
+          pick = String(quality).toUpperCase() === QUALITY.LOW ? audioMp4[0] : audioMp4[audioMp4.length - 1];
         } else if (audio.length) {
-          const preferredAudio = audioMp4.length ? audioMp4 : audio;
-          pick = String(quality).toUpperCase() === QUALITY.LOW ? preferredAudio[0] : preferredAudio[preferredAudio.length - 1];
+          pick = String(quality).toUpperCase() === QUALITY.LOW ? audio[0] : audio[audio.length - 1];
+        } else if (progressive.length) {
+          pick = progressive[0];
+        } else if (progressiveFallback.length) {
+          pick = progressiveFallback[0];
+        } else if (sd.hlsManifestUrl) {
+          useHls = true;
         }
+      }
+      if (useHls && sd.hlsManifestUrl) {
+        return {
+          url: sd.hlsManifestUrl,
+          mimeType: 'application/vnd.apple.mpegurl',
+          isHls: true,
+          bitrate: 0,
+          contentLength: undefined,
+          durationMs: undefined,
+          expiresAt: expireFromUrl(sd.hlsManifestUrl) || undefined,
+        };
       }
       const pickedUrl = directFormatUrl(pick);
       if (pick && pickedUrl) {
         const media = {
           url: pickedUrl,
-          mimeType: pick.mimeType || (forDownload ? 'audio/mp4' : 'video/mp4'),
+          mimeType: pick.mimeType || (forDownload ? 'video/mp4' : 'audio/mp4'),
           isHls: false,
           bitrate: pick.bitrate || 0,
           contentLength: pick.contentLength ? parseInt(pick.contentLength, 10) : undefined,
@@ -576,11 +590,10 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 
 async function getTrackDownloadUrl(trackId, preferredQuality, context) {
   const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
-  // Downloads and playback now use the same progressive format, so resolve
-  // through the shared playback cache: a track that was streamed or prefetched
-  // downloads instantly without a second player call.
-  let m = await resolveCachedMedia(trackId, quality, false);
-  if (m.isHls) m = await resolveCachedMedia(trackId, quality, true); // need a real file, not a playlist
+  // Downloads use progressive itag 18 (ratebypass, full-speed, standard mp42)
+  // — different from streaming's audio-only m4a, so this is a separate resolve.
+  // A track that was already downloaded/prefetched-for-download hits the cache.
+  const m = await resolveCachedMedia(trackId, quality, true);
   const isAudio = (m.mimeType || '').indexOf('audio/') === 0;
   const isMp4Audio = (m.mimeType || '').indexOf('audio/mp4') === 0;
   return {
@@ -676,7 +689,7 @@ return {
   id: 'ytm-instant',
   name: 'YouTube Music — Instant',
   author: 'nvmind',
-  version: '1.5.3',
+  version: '1.5.4',
   labels: ['YT Music', 'Instant', 'Audio', 'Download'],
   description: 'Low-latency YouTube Music. Ranked search that handles names & emoji titles, lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, reliable full-speed downloads, 4-ahead prefetch for seamless queues, no third-party resolvers.',
 
