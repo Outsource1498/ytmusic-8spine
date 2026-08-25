@@ -24,6 +24,8 @@
 //     (ratebypass), a standard mp42 the player accepts, and instantly cached
 //     if the track was already streamed or prefetched.
 //   * googlevideo URLs live ~6h, so prefetch is safe -> next track is instant.
+//     Prefetch keeps 4 tracks ahead: 8SPINE's reported queue first, then the
+//     search/album list the track came from (context alone is often one id).
 //   * Search fuses several query variants (raw + letters-only, unfiltered +
 //     videos filter) and ranks by relevance: song rows first, episodes and
 //     karaoke/covers pushed down. Names and emoji titles both match.
@@ -73,7 +75,7 @@ const PLAYER_CLIENTS = [ANDROID_CLIENT, ANDROID_VR_CLIENT, IOS_CLIENT];
 const VIDEOS_FILTER = 'EgWKAQIQAWoKEAkQChAEEAMQBA%3D%3D';
 const MEDIA_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 const MEDIA_CACHE_SAFETY_MS = 30 * 1000;
-const PREFETCH_LIMIT = 3;
+const PREFETCH_LIMIT = 4;
 const mediaCache = {};
 const mediaInflight = {};
 let lastTrackList = [];
@@ -406,14 +408,21 @@ function prefetchTracks(tracks, quality) {
   }
 }
 
+// Combine the queue 8SPINE reports with the search/list the track came from.
+// Apps often expose only `nextTrackId`, so the queue alone would prefetch a
+// single song — top it up from the last viewed list until PREFETCH_LIMIT.
 function prefetchFollowing(trackId, quality, context) {
-  const explicitIds = contextTrackIds(context);
-  if (explicitIds.length) {
-    prefetchTracks(explicitIds.map(function (id) { return { id: id }; }), quality);
-    return;
-  }
+  const ids = [];
+  const add = function (list) {
+    for (let i = 0; i < list.length && ids.length < PREFETCH_LIMIT; i++) {
+      const id = String(list[i] && list[i].id || '');
+      if (id && id !== String(trackId) && ids.indexOf(id) < 0) ids.push(id);
+    }
+  };
+  add(contextTrackIds(context).map(function (id) { return { id: id }; }));
   const index = lastTrackList.findIndex(function (track) { return String(track.id) === String(trackId); });
-  if (index >= 0) prefetchTracks(lastTrackList.slice(index + 1), quality);
+  if (index >= 0) add(lastTrackList.slice(index + 1));
+  prefetchTracks(ids.map(function (id) { return { id: id }; }), quality);
 }
 
 // --------------------------------------------------------------- searchTracks
@@ -622,8 +631,8 @@ async function getAlbum(albumId) {
     tracks.push(track);
   }
   if (!tracks.length) throw new Error(LOG + ' Album rows contained no playable track IDs');
-  // The current track request will prefetch only the following tracks from
-  // this list, avoiding unnecessary player calls for the beginning of an album.
+  // Playing a track prefetches from this album list onward (up to
+  // PREFETCH_LIMIT), so sequential album playback stays seamless.
   lastTrackList = tracks;
   return {
     album: {
@@ -642,9 +651,9 @@ return {
   id: 'ytm-instant',
   name: 'YouTube Music — Instant',
   author: 'nvmind',
-  version: '1.5.1',
+  version: '1.5.2',
   labels: ['YT Music', 'Instant', 'Audio', 'Download'],
-  description: 'Low-latency YouTube Music. Ranked search that handles names & emoji titles, lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, reliable full-speed downloads, prefetch-enabled, no third-party resolvers.',
+  description: 'Low-latency YouTube Music. Ranked search that handles names & emoji titles, lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, reliable full-speed downloads, 4-ahead prefetch for seamless queues, no third-party resolvers.',
 
   // Provider identity, matching how 8SPINE presents providers like
   // Apple Music / YouTube Music in the source picker.

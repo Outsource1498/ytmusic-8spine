@@ -2,15 +2,15 @@
   "category:modules": [
     {
       "id": "ytm-instant",
-      "name": "YOUTUBE MUSIC \u2014 INSTANT",
+      "name": "YOUTUBE MUSIC — INSTANT",
       "pkg": "com.8spine.module.youtube.instant",
       "file": "youtubeMusicInstant.8spine",
-      "download": "modules/youtubeMusicInstant.8spine?v=151",
-      "version": "v1.5.1",
-      "code": 151,
+      "download": "modules/youtubeMusicInstant.8spine?v=152",
+      "version": "v1.5.2",
+      "code": 152,
       "type": "MODULE",
       "author": "nvmind",
-      "description": "LOW-LATENCY YOUTUBE MUSIC. LEAN SINGLE-CALL RESOLVE TO A PLAYER-READY PROGRESSIVE STREAM \u2014 INSTANT PLAYBACK THAT ACTUALLY PLAYS, PREFETCH-ENABLED, NO THIRD-PARTY RESOLVERS.",
+      "description": "LOW-LATENCY YOUTUBE MUSIC. RANKED SEARCH THAT HANDLES NAMES & EMOJI TITLES, LEAN SINGLE-CALL RESOLVE TO A PLAYER-READY PROGRESSIVE STREAM — INSTANT PLAYBACK THAT ACTUALLY PLAYS, RELIABLE FULL-SPEED DOWNLOADS, 4-AHEAD PREFETCH FOR SEAMLESS QUEUES, NO THIRD-PARTY RESOLVERS.",
       "tags": [
         "YT MUSIC",
         "INSTANT",
@@ -19,12 +19,12 @@
       "featured": false,
       "trusted": false,
       "nsfw": false,
-      "size": 28593,
+      "size": 29198,
       "lang": "all",
       "folder": "modules",
       "sources": [
         {
-          "name": "YOUTUBE MUSIC \u2014 INSTANT",
+          "name": "YOUTUBE MUSIC — INSTANT",
           "lang": "all",
           "id": "ytm-instant",
           "baseUrl": "."
