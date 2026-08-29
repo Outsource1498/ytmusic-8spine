@@ -9,20 +9,28 @@
 // ============================================================================
 //  YouTube Music — INSTANT  •  8SPINE Module
 // ----------------------------------------------------------------------------
-//  Goal: real tap-to-play instant playback that ACTUALLY plays in 8SPINE.
+//  Goal: real tap-to-play instant playback that ACTUALLY plays in 8SPINE on
+//  BOTH platforms.
 //
 //  Key lessons baked in:
-//   * 8SPINE's native player needs a self-contained PROGRESSIVE mp4 (itag 18)
-//     or HLS — a raw adaptive audio-only segment (itag 140) will NOT play.
-//     So streaming serves progressive itag 18 (fast: ~180ms TTFB, un-throttled).
-//   * The return MUST include a top-level `mimeType` so the player knows how to
-//     decode the stream.
-//   * Single lean ANDROID /player call — no visitorData round-trip (that's the
-//     ~1s stall other modules hit on cold play). ANDROID_VR then IOS audio are
-//     safety fallbacks so one bot-walled client never kills playback.
-//   * Downloads serve the same progressive itag 18 as playback: full-speed
-//     (ratebypass), a standard mp42 the player accepts, and instantly cached
-//     if the track was already streamed or prefetched.
+//   * 8SPINE is React Native: iOS evaluates modules in JavaScriptCore, Android
+//     in Hermes with the app's polyfill set. Hermes does NOT reliably provide
+//     AbortController, Promise.prototype.finally, String.normalize or
+//     \p{...} regex escapes, and older builds reject `?.` at parse time. Every
+//     one of those killed this module on Android (stuck loading / no playback)
+//     while iOS kept working — so this file sticks to the conservative
+//     ES5/ES6-core style that known-working modules use. No optional chaining,
+//     no arrow functions, no template literals, no unicode-property regexes,
+//     no AbortController, no .finally.
+//   * Timeouts use a Promise.race timer (setTimeout is provided by RN on both
+//     platforms and is feature-checked anyway), so a hung socket still can't
+//     stall Promise.all forever.
+//   * Streaming prefers audio-only m4a (itag 140, audio/mp4 mime — moov at the
+//     front, range-able) which Android's player accepts directly; progressive
+//     itag 18 (video/mp4) remains the download format and a stream fallback,
+//     since iOS AVPlayer handles it but Android's audio path often won't.
+//   * ANDROID /player first, then ANDROID_VR, then IOS audio — one bot-walled
+//     client never kills playback.
 //   * googlevideo URLs live ~6h, so prefetch is safe -> next track is instant.
 //     Prefetch keeps 4 tracks ahead: 8SPINE's reported queue first, then the
 //     search/album list the track came from (context alone is often one id).
@@ -31,68 +39,94 @@
 //     karaoke/covers pushed down. Names and emoji titles both match.
 // ============================================================================
 
-const LOG = '[YTM-Instant]';
-const KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
+var LOG = '[YTM-Instant]';
+var KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 
-const SEARCH_CLIENT = {
+var SEARCH_CLIENT = {
   name: 'IOS_MUSIC', id: '26', version: '7.27.0',
   ua: 'com.google.ios.youtubemusic/7.27.0 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
   host: 'https://music.youtube.com',
 };
-const WEB_CLIENT = {
+var WEB_CLIENT = {
   name: 'WEB_REMIX', id: '67', version: '1.20260304.03.00',
   ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   host: 'https://music.youtube.com',
 };
 // Plain YouTube web search: YT Music's backend omits many official music
 // videos for anonymous callers, YouTube's ranks them first.
-const YOUTUBE_WEB_CLIENT = {
+var YOUTUBE_WEB_CLIENT = {
   name: 'WEB', id: '1', version: '2.20250814.01.00',
   ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
   host: 'https://www.youtube.com',
 };
-const ANDROID_CLIENT = {
+var ANDROID_CLIENT = {
   name: 'ANDROID', id: '3', version: '20.22.36',
   ua: 'com.google.android.youtube/20.22.36 (Linux; U; Android 15)',
   host: 'https://music.youtube.com',
 };
-const ANDROID_VR_CLIENT = {
+var ANDROID_VR_CLIENT = {
   name: 'ANDROID_VR', id: '28', version: '1.62.27',
   ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L)',
   host: 'https://music.youtube.com',
 };
-const IOS_CLIENT = {
+var IOS_CLIENT = {
   name: 'IOS', id: '5', version: '20.22.1',
   ua: 'com.google.ios.youtube/20.22.1 (iPhone16,2; U; CPU iOS 18_5 like Mac OS X)',
   host: 'https://music.youtube.com',
 };
-// Player order: ANDROID first (gives progressive itag 18 that the player accepts),
+// Player order: ANDROID first (gives progressive itag 18 the player accepts),
 // ANDROID_VR as a second progressive-capable client, IOS last (audio-only) so
 // resolve never dies on one client.
-const PLAYER_CLIENTS = [ANDROID_CLIENT, ANDROID_VR_CLIENT, IOS_CLIENT];
+var PLAYER_CLIENTS = [ANDROID_CLIENT, ANDROID_VR_CLIENT, IOS_CLIENT];
 // The old songs filter param stopped returning rows. The videos filter still
 // works and surfaces official song videos first, so it feeds the ranker.
-const VIDEOS_FILTER = 'EgWKAQIQAWoKEAkQChAEEAMQBA%3D%3D';
-const MEDIA_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
-const MEDIA_CACHE_SAFETY_MS = 30 * 1000;
-const PREFETCH_LIMIT = 4;
+var VIDEOS_FILTER = 'EgWKAQIQAWoKEAkQChAEEAMQBA%3D%3D';
+var MEDIA_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+var MEDIA_CACHE_SAFETY_MS = 30 * 1000;
+var PREFETCH_LIMIT = 4;
 // Mobile networks drop sockets silently; without a cap, a hung request stalls
 // Promise.all in search forever and the app loops loading indefinitely.
-const API_TIMEOUT_MS = 12000;
-const mediaCache = {};
-const mediaInflight = {};
-let lastTrackList = [];
+var API_TIMEOUT_MS = 12000;
+var HEAD_TIMEOUT_MS = 8000;
+var mediaCache = {};
+var mediaInflight = {};
+var lastTrackList = [];
 
-const QUALITY = { LOW: 'LOW', HIGH: 'HIGH', LOSSLESS: 'LOSSLESS' };
-const QUALITY_OPTIONS = [
+var QUALITY = { LOW: 'LOW', HIGH: 'HIGH', LOSSLESS: 'LOSSLESS' };
+var QUALITY_OPTIONS = [
   { label: 'Low (saves data)', value: QUALITY.LOW },
   { label: 'High', value: QUALITY.HIGH },
   { label: 'Best Available', value: QUALITY.LOSSLESS },
 ];
 
 // ---------------------------------------------------------------------------
+// Race a promise against a timer WITHOUT AbortController: Android's JS runtime
+// does not reliably expose AbortController (or fetch `signal` support), and a
+// bare `new AbortController()` threw on every call — which is what turned into
+// endless loading on Android. setTimeout is provided by React Native on both
+// platforms and is feature-checked anyway; when absent we simply run un-timed.
+function withTimeout(promise, ms) {
+  if (typeof setTimeout !== 'function' || !(ms > 0)) return promise;
+  return new Promise(function (resolve, reject) {
+    var done = false;
+    var timer = setTimeout(function () {
+      if (done) return;
+      done = true;
+      reject(new Error('timeout after ' + ms + 'ms'));
+    }, ms);
+    function settle(fn, value) {
+      if (done) return;
+      done = true;
+      if (typeof clearTimeout === 'function') clearTimeout(timer);
+      fn(value);
+    }
+    promise.then(function (value) { settle(resolve, value); },
+      function (error) { settle(reject, error); });
+  });
+}
+
 function buildContext(c) {
-  const client = { clientName: c.name, clientVersion: c.version, userAgent: c.ua, hl: 'en', gl: 'US' };
+  var client = { clientName: c.name, clientVersion: c.version, userAgent: c.ua, hl: 'en', gl: 'US' };
   if (c.name.indexOf('ANDROID') === 0) {
     client.androidSdkVersion = c.name === 'ANDROID_VR' ? 32 : 35;
     client.osName = 'Android'; client.osVersion = c.name === 'ANDROID_VR' ? '12L' : '15';
@@ -106,50 +140,40 @@ function buildContext(c) {
 }
 
 async function innertube(client, endpoint, payload) {
-  // Every API call is capped: a hung socket (common on mobile networks) would
-  // otherwise stall Promise.all in search forever and the app loops loading.
-  const controller = new AbortController();
-  const timer = setTimeout(function () { controller.abort(); }, API_TIMEOUT_MS);
-  let res;
-  try {
-    res = await fetch(client.host + '/youtubei/v1/' + endpoint + '?prettyPrint=false&key=' + KEY, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': client.ua,
-        'X-YouTube-Client-Name': client.id,
-        'X-YouTube-Client-Version': client.version,
-      },
-      body: JSON.stringify(Object.assign({ context: buildContext(client) }, payload)),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+  var res = await withTimeout(fetch(client.host + '/youtubei/v1/' + endpoint + '?prettyPrint=false&key=' + KEY, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': client.ua,
+      'X-YouTube-Client-Name': client.id,
+      'X-YouTube-Client-Version': client.version,
+    },
+    body: JSON.stringify(Object.assign({ context: buildContext(client) }, payload)),
+  }), API_TIMEOUT_MS);
   if (!res.ok) throw new Error(LOG + ' ' + endpoint + ' HTTP ' + res.status);
   return res.json();
 }
 
 function collect(node, key, out) {
   out = out || [];
-  if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) collect(node[i], key, out); }
+  if (Array.isArray(node)) { for (var i = 0; i < node.length; i++) collect(node[i], key, out); }
   else if (node && typeof node === 'object') {
-    const ks = Object.keys(node);
-    for (let i = 0; i < ks.length; i++) { if (ks[i] === key) out.push(node[ks[i]]); collect(node[ks[i]], key, out); }
+    var ks = Object.keys(node);
+    for (var j = 0; j < ks.length; j++) { if (ks[j] === key) out.push(node[ks[j]]); collect(node[ks[j]], key, out); }
   }
   return out;
 }
 function firstVideoId(n) {
   if (!n || typeof n !== 'object') return null;
   if (typeof n.videoId === 'string' && n.videoId.length === 11) return n.videoId;
-  const ks = Object.keys(n);
-  for (let i = 0; i < ks.length; i++) { const r = firstVideoId(n[ks[i]]); if (r) return r; }
+  var ks = Object.keys(n);
+  for (var i = 0; i < ks.length; i++) { var r = firstVideoId(n[ks[i]]); if (r) return r; }
   return null;
 }
-function runsToText(r) { if (!Array.isArray(r)) return ''; let s = ''; for (let i = 0; i < r.length; i++) s += (r[i] && r[i].text) || ''; return s; }
+function runsToText(r) { if (!Array.isArray(r)) return ''; var s = ''; for (var i = 0; i < r.length; i++) s += (r[i] && r[i].text) || ''; return s; }
 function parseDuration(s) { if (!/^\d+(:\d{1,2})+$/.test(s || '')) return 0; return s.split(':').reduce(function (a, p) { return a * 60 + parseInt(p, 10); }, 0); }
 function upscaleThumb(u) { return typeof u === 'string' ? u.replace(/=w\d+-h\d+/, '=w544-h544') : u; }
-function expireFromUrl(u) { const m = /[?&]expire=(\d+)/.exec(u || ''); return m ? parseInt(m[1], 10) * 1000 : 0; }
+function expireFromUrl(u) { var m = /[?&]expire=(\d+)/.exec(u || ''); return m ? parseInt(m[1], 10) * 1000 : 0; }
 
 function decodeParam(value) {
   try { return decodeURIComponent(String(value || '')); }
@@ -157,26 +181,26 @@ function decodeParam(value) {
 }
 
 function cipherParam(cipher, name) {
-  const match = new RegExp('(?:^|&)' + name + '=([^&]*)').exec(String(cipher || ''));
+  var match = new RegExp('(?:^|&)' + name + '=([^&]*)').exec(String(cipher || ''));
   return match ? decodeParam(match[1]) : '';
 }
 
 function directFormatUrl(format) {
   if (format && format.url) return format.url;
-  const cipher = format && (format.signatureCipher || format.cipher);
+  var cipher = format && (format.signatureCipher || format.cipher);
   if (!cipher) return '';
 
-  const url = cipherParam(cipher, 'url');
-  const signature = cipherParam(cipher, 'sig') || cipherParam(cipher, 'signature');
+  var url = cipherParam(cipher, 'url');
+  var signature = cipherParam(cipher, 'sig') || cipherParam(cipher, 'signature');
   if (!url || !signature) return '';
 
-  const separator = url.indexOf('?') >= 0 ? '&' : '?';
-  const parameter = cipherParam(cipher, 'sp') || 'signature';
+  var separator = url.indexOf('?') >= 0 ? '&' : '?';
+  var parameter = cipherParam(cipher, 'sp') || 'signature';
   return url + separator + parameter + '=' + encodeURIComponent(signature);
 }
 
 function normalizeSearchQuery(query) {
-  const raw = String(query || '');
+  var raw = String(query || '');
   try {
     return decodeURIComponent(raw);
   } catch (e) {
@@ -184,24 +208,41 @@ function normalizeSearchQuery(query) {
   }
 }
 
+// Safe nested getters — no optional chaining anywhere: older Hermes builds
+// throw a SyntaxError on `?.` when the module source is evaluated, which kills
+// the whole module (stuck loading) before a single line can run.
 function browseIdFromRun(run) {
-  return run?.navigationEndpoint?.browseEndpoint?.browseId || '';
+  var nav = run && run.navigationEndpoint;
+  var browse = nav && nav.browseEndpoint;
+  return (browse && browse.browseId) || '';
+}
+
+function flexColumn(renderer, index) {
+  var cols = renderer && renderer.flexColumns;
+  var col = cols && cols[index];
+  return (col && col.musicResponsiveListItemFlexColumnRenderer) || null;
+}
+
+function fixedColumn(renderer, index) {
+  var cols = renderer && renderer.fixedColumns;
+  var col = cols && cols[index];
+  return (col && col.musicResponsiveListItemFixedColumnRenderer) || null;
 }
 
 function subtitleMetadata(runs) {
-  const text = runsToText(runs);
-  const parts = text.split(/\s*[•·]\s*/).map(function (part) { return part.trim(); }).filter(Boolean);
-  let duration = 0;
-  let type = '';
-  const remaining = [];
-  for (let i = 0; i < parts.length; i++) {
-    const parsed = parseDuration(parts[i]);
+  var text = runsToText(runs);
+  var parts = text.split(/\s*[•·]\s*/).map(function (part) { return part.trim(); }).filter(Boolean);
+  var duration = 0;
+  var type = '';
+  var remaining = [];
+  for (var i = 0; i < parts.length; i++) {
+    var parsed = parseDuration(parts[i]);
     if (parsed && !duration) { duration = parsed; continue; }
-    const typeMatch = /^(Song|Video|Episode|Podcast|EP|Single)$/i.exec(parts[i]);
+    var typeMatch = /^(Song|Video|Episode|Podcast|EP|Single)$/i.exec(parts[i]);
     if (typeMatch) { if (!type) type = typeMatch[1].toLowerCase(); continue; }
     remaining.push(parts[i]);
   }
-  const browseIds = (runs || []).map(function (run) { return browseIdFromRun(run); }).filter(Boolean);
+  var browseIds = (runs || []).map(function (run) { return browseIdFromRun(run); }).filter(Boolean);
   return {
     artist: remaining[0] || '',
     album: remaining[1] || '',
@@ -213,41 +254,53 @@ function subtitleMetadata(runs) {
 }
 
 function rendererTitle(renderer) {
-  return runsToText(renderer?.title?.runs) ||
-    runsToText(renderer?.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs) || '';
+  var t = renderer && renderer.title;
+  var flex = flexColumn(renderer, 0);
+  return runsToText(t && t.runs) ||
+    runsToText(flex && flex.text && flex.text.runs) || '';
 }
 
 function rendererSubtitleRuns(renderer) {
-  return renderer?.subtitle?.runs ||
-    renderer?.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+  var st = renderer && renderer.subtitle;
+  var flex = flexColumn(renderer, 1);
+  return (st && st.runs) ||
+    (flex && flex.text && flex.text.runs) || [];
 }
 
 function rendererVideoId(renderer) {
-  return renderer?.navigationEndpoint?.watchEndpoint?.videoId ||
-    renderer?.playlistItemData?.videoId || firstVideoId(renderer);
+  var nav = renderer && renderer.navigationEndpoint;
+  var watch = nav && nav.watchEndpoint;
+  var plist = renderer && renderer.playlistItemData;
+  return (watch && watch.videoId) ||
+    (plist && plist.videoId) || firstVideoId(renderer);
 }
 
 function rendererCover(renderer, fallback) {
-  const thumbs = renderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
+  var thumb = renderer && renderer.thumbnail;
+  var mtr = thumb && thumb.musicThumbnailRenderer;
+  var tt = mtr && mtr.thumbnail;
+  var thumbs = (tt && tt.thumbnails) || [];
   if (!thumbs.length) return fallback || '';
   return upscaleThumb(thumbs[thumbs.length - 1].url) || fallback || '';
 }
 
 function mapTrackRenderer(renderer, fallback) {
-  const subtitleRuns = rendererSubtitleRuns(renderer);
-  const meta = subtitleMetadata(subtitleRuns);
-  const fixedDuration = renderer?.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
-  const videoId = rendererVideoId(renderer);
+  var subtitleRuns = rendererSubtitleRuns(renderer);
+  var meta = subtitleMetadata(subtitleRuns);
+  var fixed = fixedColumn(renderer, 0);
+  var fixedRuns = fixed && fixed.text && fixed.text.runs;
+  var fixedDuration = (fixedRuns && fixedRuns[0] && fixedRuns[0].text) || '';
+  var videoId = rendererVideoId(renderer);
   if (!videoId) return null;
   return {
     id: videoId,
     title: rendererTitle(renderer).trim(),
-    artist: meta.artist || fallback?.artist || 'Unknown Artist',
-    artistId: meta.artistId || fallback?.artistId,
-    album: meta.album || fallback?.album || '',
-    albumId: meta.albumId || fallback?.albumId,
+    artist: meta.artist || (fallback && fallback.artist) || 'Unknown Artist',
+    artistId: meta.artistId || (fallback && fallback.artistId),
+    album: meta.album || (fallback && fallback.album) || '',
+    albumId: meta.albumId || (fallback && fallback.albumId),
     duration: meta.duration || parseDuration(fixedDuration),
-    albumCover: rendererCover(renderer, fallback?.albumCover),
+    albumCover: rendererCover(renderer, fallback && fallback.albumCover),
     mediaType: meta.type || '',
   };
 }
@@ -255,39 +308,45 @@ function mapTrackRenderer(renderer, fallback) {
 // Plain-YouTube search rows (videoRenderer) — artist is the channel name and
 // there is no album linkage, but these carry the official music videos.
 function mapVideoRenderer(renderer) {
-  const videoId = renderer?.videoId;
+  var videoId = renderer && renderer.videoId;
   if (!videoId) return null;
-  const thumbs = renderer?.thumbnail?.thumbnails || [];
+  var owner = renderer.ownerText;
+  var ownerRuns = owner && owner.runs;
+  var firstOwner = ownerRuns && ownerRuns[0];
+  var ownerNav = firstOwner && firstOwner.navigationEndpoint;
+  var ownerBrowse = ownerNav && ownerNav.browseEndpoint;
+  var length = renderer.lengthText;
+  var thumbs = (renderer.thumbnail && renderer.thumbnail.thumbnails) || [];
   return {
     id: videoId,
-    title: runsToText(renderer?.title?.runs).trim(),
-    artist: runsToText(renderer?.ownerText?.runs).trim() || 'Unknown Artist',
-    artistId: renderer?.ownerText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId || undefined,
+    title: runsToText(renderer.title && renderer.title.runs).trim(),
+    artist: runsToText(ownerRuns).trim() || 'Unknown Artist',
+    artistId: (ownerBrowse && ownerBrowse.browseId) || undefined,
     album: '',
     albumId: undefined,
-    duration: parseDuration(renderer?.lengthText?.simpleText || ''),
+    duration: parseDuration((length && length.simpleText) || ''),
     albumCover: thumbs.length ? upscaleThumb(thumbs[thumbs.length - 1].url) : '',
     mediaType: 'video',
   };
 }
 
 function mapSearchRows(data, limit) {
-  const rows = collect(data, 'musicTwoColumnItemRenderer')
+  var rows = collect(data, 'musicTwoColumnItemRenderer')
     .concat(collect(data, 'musicResponsiveListItemRenderer'));
-  const videos = collect(data, 'videoRenderer');
-  const tracks = [];
-  const seen = {};
-  for (let i = 0; i < rows.length && tracks.length < limit; i++) {
-    const track = mapTrackRenderer(rows[i]);
+  var videos = collect(data, 'videoRenderer');
+  var tracks = [];
+  var seen = {};
+  for (var i = 0; i < rows.length && tracks.length < limit; i++) {
+    var track = mapTrackRenderer(rows[i]);
     if (!track || seen[track.id]) continue;
     seen[track.id] = true;
     tracks.push(track);
   }
-  for (let i = 0; i < videos.length && tracks.length < limit; i++) {
-    const track = mapVideoRenderer(videos[i]);
-    if (!track || !track.title || seen[track.id]) continue;
-    seen[track.id] = true;
-    tracks.push(track);
+  for (var j = 0; j < videos.length && tracks.length < limit; j++) {
+    var vtrack = mapVideoRenderer(videos[j]);
+    if (!vtrack || !vtrack.title || seen[vtrack.id]) continue;
+    seen[vtrack.id] = true;
+    tracks.push(vtrack);
   }
   return tracks;
 }
@@ -296,33 +355,40 @@ function mapSearchRows(data, limit) {
 // Comparison-only normalization: strips emoji, diacritics and punctuation so
 // titles like "In the Name of 💖LOVE💖" match a typed "love" query. Original
 // titles are never mutated — this only feeds scoring.
+//
+// The letter class is an explicit range set instead of \p{L}\p{N}: unicode
+// property escapes are not supported by older Hermes regexes on Android and
+// made the whole file fail to parse. Surrogate halves (emoji) are not in any
+// range, so astral characters are stripped too. String.normalize is only used
+// when present (Hermes can ship without Intl).
+var LETTERS_ONLY_RE = /[^0-9A-Za-z\u00AA\u00B5\u00BA\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02AF\u0370-\u052F\u0531-\u058F\u0591-\u05F4\u0600-\u06FF\u0900-\u097F\u0E00-\u0E7F\u10A0-\u10FF\u1100-\u11FF\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA48F\uAC00-\uD7A3]+/g;
+
 function normalizeForMatch(value) {
-  return String(value || '')
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim();
+  var s = String(value || '').toLowerCase();
+  if (typeof s.normalize === 'function') {
+    try { s = s.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); } catch (e) { /* no Intl build */ }
+  }
+  return s.replace(LETTERS_ONLY_RE, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function matchTokens(value) {
-  const normalized = normalizeForMatch(value);
+  var normalized = normalizeForMatch(value);
   return normalized ? normalized.split(' ') : [];
 }
 
-const NON_ORIGINAL_RE = /\b(karaoke|cover|tribute|instrumental|nightcore|sped up|slowed)\b/;
+var NON_ORIGINAL_RE = /\b(karaoke|cover|tribute|instrumental|nightcore|sped up|slowed)\b/;
 
 // Higher is better. rankSum is the fused position across the query variants
 // (YouTube's own relevance order), the rest are content signals.
 function scoreTrack(track, queryTokens, queryNorm, rankSum) {
-  let score = rankSum * 2;
+  var score = rankSum * 2;
   if (track.mediaType === 'song') score += 4;
   else if (track.mediaType === 'episode' || track.mediaType === 'podcast') score -= 5;
 
   if (queryNorm) {
-    const haystack = normalizeForMatch(track.title + ' ' + track.artist);
-    let hits = 0;
-    for (let i = 0; i < queryTokens.length; i++) {
+    var haystack = normalizeForMatch(track.title + ' ' + track.artist);
+    var hits = 0;
+    for (var i = 0; i < queryTokens.length; i++) {
       if (haystack.indexOf(queryTokens[i]) >= 0) hits++;
     }
     score += (hits / queryTokens.length) * 4;
@@ -338,42 +404,42 @@ function scoreTrack(track, queryTokens, queryNorm, rankSum) {
 }
 
 function rankTrackLists(lists, query, limit) {
-  const queryTokens = matchTokens(query);
-  const queryNorm = queryTokens.join(' ');
-  const byId = {};
-  for (let li = 0; li < lists.length; li++) {
-    const list = lists[li] || [];
-    for (let i = 0; i < list.length; i++) {
-      const track = list[i];
+  var queryTokens = matchTokens(query);
+  var queryNorm = queryTokens.join(' ');
+  var byId = {};
+  for (var li = 0; li < lists.length; li++) {
+    var list = lists[li] || [];
+    for (var i = 0; i < list.length; i++) {
+      var track = list[i];
       if (!track || !track.id) continue;
-      const entry = byId[track.id] || (byId[track.id] = { track: track, rankSum: 0 });
+      var entry = byId[track.id] || (byId[track.id] = { track: track, rankSum: 0 });
       entry.rankSum += 1 / (i + 1);
     }
   }
-  const ranked = Object.keys(byId).map(function (id) {
-    const entry = byId[id];
+  var ranked = Object.keys(byId).map(function (id) {
+    var entry = byId[id];
     return { track: entry.track, score: scoreTrack(entry.track, queryTokens, queryNorm, entry.rankSum) };
   });
   ranked.sort(function (a, b) { return b.score - a.score; });
   return ranked.slice(0, limit).map(function (entry) {
-    const track = entry.track;
+    var track = entry.track;
     delete track.mediaType;
     return track;
   });
 }
 
 function contextTrackIds(context) {
-  const ids = [];
-  const add = function (value) {
+  var ids = [];
+  function add(value) {
     if (Array.isArray(value)) {
-      for (let i = 0; i < value.length; i++) add(value[i]);
+      for (var i = 0; i < value.length; i++) add(value[i]);
     } else if (typeof value === 'string' && value && ids.indexOf(value) < 0) {
       ids.push(value);
     } else if (value && typeof value === 'object') {
       add(value.id || value.videoId || value.trackId || value.youtubeId);
     }
-  };
-  const source = context || {};
+  }
+  var source = context || {};
   add(source.nextTrackId);
   add(source.nextTrackIds);
   add(source.nextTracks);
@@ -387,16 +453,20 @@ function cacheKey(trackId, quality, forDownload) {
 }
 
 function cachedMedia(key) {
-  const entry = mediaCache[key];
+  var entry = mediaCache[key];
   if (!entry) return null;
   if (entry.expiresAt > Date.now() + MEDIA_CACHE_SAFETY_MS) return entry.media;
   delete mediaCache[key];
   return null;
 }
 
+// No Promise.prototype.finally here: Hermes builds shipped by older React
+// Native lack it, and resolveCachedMedia used it on the critical playback path
+// (search worked, tap-to-play silently died). The two-handler then() below is
+// semantically identical and safe everywhere.
 function resolveCachedMedia(trackId, quality, forDownload) {
-  const key = cacheKey(trackId, quality, forDownload);
-  const cached = cachedMedia(key);
+  var key = cacheKey(trackId, quality, forDownload);
+  var cached = cachedMedia(key);
   if (cached) return Promise.resolve(cached);
   if (mediaInflight[key]) return mediaInflight[key];
   mediaInflight[key] = resolveMediaUncached(trackId, quality, forDownload)
@@ -405,18 +475,22 @@ function resolveCachedMedia(trackId, quality, forDownload) {
         media: media,
         expiresAt: media.expiresAt || (Date.now() + MEDIA_CACHE_TTL_MS),
       };
+      delete mediaInflight[key];
       return media;
-    })
-    .finally(function () { delete mediaInflight[key]; });
+    }, function (error) {
+      delete mediaInflight[key];
+      throw error;
+    });
   return mediaInflight[key];
 }
 
 function prefetchTracks(tracks, quality) {
-  const items = (tracks || []).slice(0, PREFETCH_LIMIT);
-  for (let i = 0; i < items.length; i++) {
-    if (!items[i]?.id) continue;
-    resolveCachedMedia(items[i].id, quality || QUALITY.HIGH, false).catch(function (error) {
-      console.log(LOG, 'Prefetch failed for', items[i].id, error.message);
+  var items = (tracks || []).slice(0, PREFETCH_LIMIT);
+  for (var i = 0; i < items.length; i++) {
+    var id = items[i] && items[i].id;
+    if (!id) continue;
+    resolveCachedMedia(id, quality || QUALITY.HIGH, false).catch(function (error) {
+      console.log(LOG, 'Prefetch failed:', error && error.message);
     });
   }
 }
@@ -425,45 +499,46 @@ function prefetchTracks(tracks, quality) {
 // Apps often expose only `nextTrackId`, so the queue alone would prefetch a
 // single song — top it up from the last viewed list until PREFETCH_LIMIT.
 function prefetchFollowing(trackId, quality, context) {
-  const ids = [];
-  const add = function (list) {
-    for (let i = 0; i < list.length && ids.length < PREFETCH_LIMIT; i++) {
-      const id = String(list[i] && list[i].id || '');
+  var ids = [];
+  function add(list) {
+    for (var i = 0; i < list.length && ids.length < PREFETCH_LIMIT; i++) {
+      var id = String(list[i] && list[i].id || '');
       if (id && id !== String(trackId) && ids.indexOf(id) < 0) ids.push(id);
     }
-  };
+  }
   add(contextTrackIds(context).map(function (id) { return { id: id }; }));
-  const index = lastTrackList.findIndex(function (track) { return String(track.id) === String(trackId); });
-  if (index >= 0) add(lastTrackList.slice(index + 1));
+  for (var i = 0; i < lastTrackList.length; i++) {
+    if (String(lastTrackList[i].id) === String(trackId)) { add(lastTrackList.slice(i + 1)); break; }
+  }
   prefetchTracks(ids.map(function (id) { return { id: id }; }), quality);
 }
 
 // --------------------------------------------------------------- searchTracks
 async function searchTracks(query, limit) {
-  const max = limit || 25;
-  const raw = normalizeSearchQuery(query).replace(/\s+/g, ' ').trim();
+  var max = limit || 25;
+  var raw = normalizeSearchQuery(query).replace(/\s+/g, ' ').trim();
   // Emoji-titled tracks ("In the Name of 💖LOVE💖") surface better when the
   // emoji is kept, but some queries resolve poorly with symbols in them — so
   // query both the raw string and its letters-only form and let the ranker
   // fuse the lists.
-  const queries = [raw];
-  const lettersOnly = matchTokens(raw).join(' ');
+  var queries = [raw];
+  var lettersOnly = matchTokens(raw).join(' ');
   if (lettersOnly && lettersOnly !== raw.toLowerCase()) queries.push(lettersOnly);
 
-  const requests = [];
-  for (let qi = 0; qi < queries.length; qi++) {
+  var requests = [];
+  for (var qi = 0; qi < queries.length; qi++) {
     requests.push(innertube(WEB_CLIENT, 'search', { query: queries[qi] }).catch(function () { return null; }));
     requests.push(innertube(WEB_CLIENT, 'search', { query: queries[qi], params: VIDEOS_FILTER }).catch(function () { return null; }));
     requests.push(innertube(YOUTUBE_WEB_CLIENT, 'search', { query: queries[qi] }).catch(function () { return null; }));
   }
   requests.push(innertube(SEARCH_CLIENT, 'search', { query: raw }).catch(function () { return null; }));
 
-  const responses = await Promise.all(requests);
-  const lists = [];
-  for (let i = 0; i < responses.length; i++) {
+  var responses = await Promise.all(requests);
+  var lists = [];
+  for (var i = 0; i < responses.length; i++) {
     if (responses[i]) lists.push(mapSearchRows(responses[i], max));
   }
-  const tracks = rankTrackLists(lists, raw, max);
+  var tracks = rankTrackLists(lists, raw, max);
   // Keep the result list for queue-aware prefetch. Do not resolve speculative
   // media while search is returning; that adds contention to first playback.
   lastTrackList = tracks;
@@ -475,31 +550,36 @@ async function searchTracks(query, limit) {
 // format. `forDownload` skips the HLS fallback — a download must be a file.
 async function resolveMediaUncached(trackId, quality, forDownload) {
   if (!trackId) throw new Error(LOG + ' Missing trackId');
-  let lastErr = null;
+  var lastErr = null;
 
-  for (let ci = 0; ci < PLAYER_CLIENTS.length; ci++) {
+  for (var ci = 0; ci < PLAYER_CLIENTS.length; ci++) {
     try {
-      const data = await innertube(PLAYER_CLIENTS[ci], 'player', {
+      var data = await innertube(PLAYER_CLIENTS[ci], 'player', {
         videoId: String(trackId), contentCheckOk: true, racyCheckOk: true,
       });
-      const ps = (data.playabilityStatus && data.playabilityStatus.status) || 'UNKNOWN';
-      if (ps !== 'OK') { lastErr = new Error(LOG + ' ' + PLAYER_CLIENTS[ci].name + ': ' + ((data.playabilityStatus && data.playabilityStatus.reason) || ps)); continue; }
+      var status = data.playabilityStatus && data.playabilityStatus.status;
+      var ps = status || 'UNKNOWN';
+      if (ps !== 'OK') {
+        lastErr = new Error(LOG + ' ' + PLAYER_CLIENTS[ci].name + ': ' +
+          ((data.playabilityStatus && data.playabilityStatus.reason) || ps));
+        continue;
+      }
 
-      const sd = data.streamingData || {};
-      const progressive = (sd.formats || [])
+      var sd = data.streamingData || {};
+      var progressive = (sd.formats || [])
         .filter(function (f) {
-          const mime = f.mimeType || '';
+          var mime = f.mimeType || '';
           return directFormatUrl(f) && mime.indexOf('video/mp4') === 0 && mime.indexOf('mp4a') >= 0;
         });
-      const progressiveFallback = (sd.formats || [])
+      var progressiveFallback = (sd.formats || [])
         .filter(function (f) { return directFormatUrl(f) && (f.mimeType || '').indexOf('video/mp4') === 0; });
-      const audio = (sd.adaptiveFormats || [])
+      var audio = (sd.adaptiveFormats || [])
         .filter(function (f) { return directFormatUrl(f) && (f.mimeType || '').indexOf('audio/') === 0; })
         .sort(function (a, b) { return (a.bitrate || 0) - (b.bitrate || 0); });
-      const audioMp4 = audio.filter(function (f) { return (f.mimeType || '').indexOf('audio/mp4') === 0; });
+      var audioMp4 = audio.filter(function (f) { return (f.mimeType || '').indexOf('audio/mp4') === 0; });
 
-      let pick = null;
-      let useHls = false;
+      var pick = null;
+      var useHls = false;
       if (forDownload) {
         // Downloads must be a complete, standard file: progressive itag 18 is
         // ratebypass'd (full-speed) and a normal mp42 the player accepts. The
@@ -509,11 +589,11 @@ async function resolveMediaUncached(trackId, quality, forDownload) {
         if (progressive.length) pick = progressive[0];
         else if (progressiveFallback.length) pick = progressiveFallback[0];
         else {
-          const preferredAudio = audioMp4.length ? audioMp4 : audio;
+          var preferredAudio = audioMp4.length ? audioMp4 : audio;
           if (preferredAudio.length) pick = String(quality).toUpperCase() === QUALITY.LOW ? preferredAudio[0] : preferredAudio[preferredAudio.length - 1];
         }
       } else {
-        // STREAMING: 8SPINE's spec requires a "direct, playable AUDIO URL
+        // STREAMING: 8SPINE's spec wants a "direct, playable AUDIO URL
         // (MP3, FLAC, M4A)". Returning video/mp4 (itag 18) worked on iOS
         // (AVPlayer extracts audio from video containers) but Android's audio
         // player rejects video/* mime types — length shows but no playback.
@@ -544,9 +624,9 @@ async function resolveMediaUncached(trackId, quality, forDownload) {
           expiresAt: expireFromUrl(sd.hlsManifestUrl) || undefined,
         };
       }
-      const pickedUrl = directFormatUrl(pick);
+      var pickedUrl = directFormatUrl(pick);
       if (pick && pickedUrl) {
-        const media = {
+        var media = {
           url: pickedUrl,
           mimeType: pick.mimeType || (forDownload ? 'video/mp4' : 'audio/mp4'),
           isHls: false,
@@ -557,12 +637,12 @@ async function resolveMediaUncached(trackId, quality, forDownload) {
         };
         // YouTube omits contentLength for itag 18; Android's extractor commonly
         // needs it to set up buffering (iOS AVPlayer tolerates unknown length).
-        // A HEAD fills it in cheaply when missing — avoids the "loops loading"
-        // state on Android.
+        // A HEAD fills it in cheaply when missing — timed, because a bare HEAD
+        // that hangs would itself cause an endless spinner.
         if (!media.contentLength && !forDownload) {
           try {
-            const head = await fetch(pickedUrl, { method: 'HEAD' });
-            const len = parseInt(head.headers.get('content-length') || '', 10);
+            var head = await withTimeout(fetch(pickedUrl, { method: 'HEAD' }), HEAD_TIMEOUT_MS);
+            var len = parseInt(head.headers.get('content-length') || '', 10);
             if (len > 0) media.contentLength = len;
           } catch (e) { /* non-fatal: player can still stream without it */ }
         }
@@ -575,8 +655,8 @@ async function resolveMediaUncached(trackId, quality, forDownload) {
 }
 
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
-  const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
-  const m = await resolveCachedMedia(trackId, quality, false);
+  var quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
+  var m = await resolveCachedMedia(trackId, quality, false);
   prefetchFollowing(trackId, quality, context);
   return {
     streamUrl: m.url,
@@ -589,13 +669,13 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 }
 
 async function getTrackDownloadUrl(trackId, preferredQuality, context) {
-  const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
+  var quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
   // Downloads use progressive itag 18 (ratebypass, full-speed, standard mp42)
   // — different from streaming's audio-only m4a, so this is a separate resolve.
   // A track that was already downloaded/prefetched-for-download hits the cache.
-  const m = await resolveCachedMedia(trackId, quality, true);
-  const isAudio = (m.mimeType || '').indexOf('audio/') === 0;
-  const isMp4Audio = (m.mimeType || '').indexOf('audio/mp4') === 0;
+  var m = await resolveCachedMedia(trackId, quality, true);
+  var isAudio = (m.mimeType || '').indexOf('audio/') === 0;
+  var isMp4Audio = (m.mimeType || '').indexOf('audio/mp4') === 0;
   return {
     downloadUrl: m.url,
     streamUrl: m.url,
@@ -606,31 +686,34 @@ async function getTrackDownloadUrl(trackId, preferredQuality, context) {
 }
 
 function albumHeader(data, albumId) {
-  const header = data?.header?.musicDetailHeaderRenderer ||
-    data?.header?.musicImmersiveHeaderRenderer ||
+  var header = (data.header && (data.header.musicDetailHeaderRenderer || data.header.musicImmersiveHeaderRenderer)) ||
     collect(data, 'musicDetailHeaderRenderer')[0] ||
     collect(data, 'musicImmersiveHeaderRenderer')[0] || {};
-  const microTitle = data?.microformat?.microformatDataRenderer?.title || '';
-  const headerTitle = runsToText(header?.title?.runs).trim();
-  const rawTitle = headerTitle || microTitle;
-  const byMatch = /^(.*?)\s+-\s+(?:Full Moon Edition|Album|Single|EP)\s+by\s+(.+)$/i.exec(rawTitle);
-  const title = (byMatch ? byMatch[1] : rawTitle).trim() || String(albumId);
-  const headerMeta = subtitleMetadata(header?.subtitle?.runs || []);
+  var microformat = data.microformat && data.microformat.microformatDataRenderer;
+  var microTitle = (microformat && microformat.title) || '';
+  var headerTitle = runsToText(header.title && header.title.runs).trim();
+  var rawTitle = headerTitle || microTitle;
+  var byMatch = /^(.*?)\s+-\s+(?:Full Moon Edition|Album|Single|EP)\s+by\s+(.+)$/i.exec(rawTitle);
+  var title = (byMatch ? byMatch[1] : rawTitle).trim() || String(albumId);
+  var headerMeta = subtitleMetadata((header.subtitle && header.subtitle.runs) || []);
   return {
     title: title,
     artist: byMatch ? byMatch[2].trim() : (headerMeta.artist || 'Unknown Artist'),
     artistId: headerMeta.artistId,
-    albumCover: rendererCover(header, '') || rendererCover(data?.background, ''),
+    albumCover: rendererCover(header, '') || rendererCover(data.background, ''),
   };
 }
 
 function albumRows(data) {
-  const shelves = collect(data, 'musicShelfRenderer');
-  for (let i = 0; i < shelves.length; i++) {
-    const rows = (shelves[i].contents || [])
-      .map(function (item) { return item?.musicResponsiveListItemRenderer || item?.musicTwoColumnItemRenderer; })
+  var shelves = collect(data, 'musicShelfRenderer');
+  for (var i = 0; i < shelves.length; i++) {
+    var rows = (shelves[i].contents || [])
+      .map(function (item) {
+        return (item && (item.musicResponsiveListItemRenderer || item.musicTwoColumnItemRenderer)) || null;
+      })
       .filter(Boolean);
-    if (rows.some(function (row) { return rendererVideoId(row); })) return rows;
+    var hasVideo = rows.some(function (row) { return rendererVideoId(row); });
+    if (hasVideo) return rows;
   }
   return collect(data, 'musicResponsiveListItemRenderer')
     .concat(collect(data, 'musicTwoColumnItemRenderer'));
@@ -638,32 +721,32 @@ function albumRows(data) {
 
 async function getAlbum(albumId) {
   if (!albumId) throw new Error(LOG + ' Missing albumId');
-  const clients = [WEB_CLIENT, SEARCH_CLIENT];
-  let chosen = null;
-  let rows = [];
-  let lastErr = null;
-  for (let i = 0; i < clients.length; i++) {
+  var clients = [WEB_CLIENT, SEARCH_CLIENT];
+  var chosen = null;
+  var rows = [];
+  var lastErr = null;
+  for (var i = 0; i < clients.length; i++) {
     try {
-      const data = await innertube(clients[i], 'browse', { browseId: String(albumId) });
-      const candidateRows = albumRows(data);
+      var data = await innertube(clients[i], 'browse', { browseId: String(albumId) });
+      var candidateRows = albumRows(data);
       if (candidateRows.length) { chosen = data; rows = candidateRows; break; }
       lastErr = new Error(LOG + ' ' + clients[i].name + ': album has no track rows');
     } catch (e) { lastErr = e; }
   }
   if (!chosen) throw (lastErr || new Error(LOG + ' Could not load album'));
 
-  const info = albumHeader(chosen, albumId);
-  const fallback = {
+  var info = albumHeader(chosen, albumId);
+  var fallback = {
     artist: info.artist,
     artistId: info.artistId,
     album: info.title,
     albumId: String(albumId),
     albumCover: info.albumCover,
   };
-  const tracks = [];
-  const seen = {};
-  for (let i = 0; i < rows.length; i++) {
-    const track = mapTrackRenderer(rows[i], fallback);
+  var tracks = [];
+  var seen = {};
+  for (var t = 0; t < rows.length; t++) {
+    var track = mapTrackRenderer(rows[t], fallback);
     if (!track || seen[track.id]) continue;
     seen[track.id] = true;
     tracks.push(track);
@@ -689,9 +772,9 @@ return {
   id: 'ytm-instant',
   name: 'YouTube Music — Instant',
   author: 'nvmind',
-  version: '1.5.4',
+  version: '1.5.5',
   labels: ['YT Music', 'Instant', 'Audio', 'Download'],
-  description: 'Low-latency YouTube Music. Ranked search that handles names & emoji titles, lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, reliable full-speed downloads, 4-ahead prefetch for seamless queues, no third-party resolvers.',
+  description: 'Low-latency YouTube Music. Ranked search that handles names & emoji titles, lean single-call resolve to a player-ready stream — instant playback that actually plays on iOS AND Android, reliable full-speed downloads, 4-ahead prefetch for seamless queues, no third-party resolvers.',
 
   // Provider identity, matching how 8SPINE presents providers like
   // Apple Music / YouTube Music in the source picker.
