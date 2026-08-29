@@ -574,12 +574,33 @@ async function resolveMediaUncached(trackId, quality, forDownload) {
   throw (lastErr || new Error(LOG + ' Could not resolve stream'));
 }
 
+// --------------------------------------------------------- android playback fix
+// 8SPINE's SongPlayerV2 classifies a stream as HLS if the URL merely CONTAINS
+// the substring 'googlevideo.com' (case-sensitive check — decompiled v1.3.3
+// APK: url.includes('googlevideo.com') -> TrackType.HLS). react-native-track-
+// player on Android then hands the URL to ExoPlayer's HLS media source, which
+// parses the progressive mp4/m4a as an HLS playlist, fails, retries through
+// the app's "HLS stall" loop and the UI shows an endless loader. iOS AVPlayer
+// ignores the type hint and sniffs the content, which is why streaming worked
+// on iOS only.
+//
+// Hostnames are case-insensitive (RFC 3986 §3.2.2), so upper-casing ONLY the
+// host keeps the URL semantically identical for every HTTP stack (DNS, TLS
+// SNI, cert matching, googlevideo itself) while no longer matching the app's
+// lower-case sniff. The stream then rides the app's DEFAULT (progressive)
+// player path on BOTH platforms — which is what the file actually is.
+function playerSafeUrl(url) {
+  return String(url || '').replace(/^(https?:\/\/)([^/]+)/, function (all, scheme, host) {
+    return scheme + host.toUpperCase();
+  });
+}
+
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
   const quality = (context && context.settings && context.settings.quality && context.settings.quality.value) || preferredQuality || QUALITY.HIGH;
   const m = await resolveCachedMedia(trackId, quality, false);
   prefetchFollowing(trackId, quality, context);
   return {
-    streamUrl: m.url,
+    streamUrl: playerSafeUrl(m.url),
     streamType: m.isHls ? 'hls' : 'direct',
     mimeType: m.mimeType,          // top-level so the player configures decode
     contentLength: m.contentLength,
@@ -689,7 +710,7 @@ return {
   id: 'ytm-instant',
   name: 'YouTube Music — Instant',
   author: 'nvmind',
-  version: '1.5.6',
+  version: '1.6.0',
   labels: ['YT Music', 'Instant', 'Audio', 'Download'],
   description: 'Low-latency YouTube Music. Ranked search that handles names & emoji titles, lean single-call resolve to a player-ready progressive stream — instant playback that actually plays, reliable full-speed downloads, 4-ahead prefetch for seamless queues, no third-party resolvers.',
 
